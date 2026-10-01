@@ -1,0 +1,352 @@
+nameOverride: ""
+# Prefix of every Kubernetes object: Deployment/Service `ms-bribrain-nilam-ocr-slipgaji-<service>`, the same
+# names as the Bitbucket repos (BITBUCKET_REPOS.md). The entry Service is `ms-bribrain-nilam-ocr-slipgaji`.
+fullnameOverride: ms-bribrain-nilam-ocr-slipgaji
+
+revisionHistoryLimit: 5
+# Default untuk semua service; services.<nama>.terminationGracePeriodSeconds menimpanya.
+# 45 = drain job 30 dtk (PIPELINE_DRAIN_TIMEOUT_SECONDS) + preStop 5 dtk + cadangan.
+terminationGracePeriodSeconds: 45
+
+environment: production
+
+image:
+  registry: asia-southeast2-docker.pkg.dev/common-cicd-dev-01/gc-bribrain-dev-gar-temp-01
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+existingSecret: nilam-ocr-slipgaji-secrets
+secretKeys:
+  apiKey: API_KEY
+  # Opsional: key lain yang juga diterima (dipisah koma) selama rotasi; lihat README "API key".
+  apiKeys: API_KEYS
+  databaseUrl: DATABASE_URL
+  orchestrationApiKey: ORCHESTRATION_API_KEY
+  # Nilai X-Callback-Key untuk callback hasil Orkestrasi (orchestration.callbackFormat: result).
+  callbackKey: ORCHESTRATION_CALLBACK_KEY
+
+# Buat Secret di atas dari GCP Secret Manager lewat External Secrets Operator.
+# Mati = Secret dibuat manual (lihat README). Butuh CRD ESO dan ClusterSecretStore di cluster.
+externalSecret:
+  enabled: false
+  apiVersion: external-secrets.io/v1
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: gcp-secret-manager
+  remoteKeys:
+    apiKey: nilam-ocr-slipgaji-api-key
+    databaseUrl: nilam-ocr-slipgaji-database-url
+    orchestrationApiKey: nilam-ocr-slipgaji-orchestration-api-key
+    # Kosong = tidak diambil dari Secret Manager.
+    callbackKey: ""
+
+# Callback tahap ke Orkestrasi pusat, dikirim oleh ketiga tahap pipeline (bukan oleh orchestrator).
+# Kosong = tidak ada callback yang dikirim maupun diantrekan; hasil sampai ke Orkestrasi lewat tabelnya
+# sendiri (ORCHESTRATION_OUTCOME_TABLE dan/atau ORCHESTRATION_API_EVENTS_TABLE di commonEnv) dan
+# GET /v1/extract-ocr/{request_id} di orchestrator. Tahap pipeline menolak start kalau semuanya kosong.
+orchestration:
+  url: ""
+  callbackPath: /v1/callbacks/stage
+  timeoutSeconds: "10"
+  # stage  = satu callback per tahap (OCR, STRUCTURING, SCORING) dengan X-API-Key.
+  # result = satu callback hasil per request saat selesai (completed dari scoring, failed dari tahap
+  #          mana pun) dengan X-Callback-Key dari secretKeys.callbackKey; tanpa key, service menolak start.
+  callbackFormat: stage
+
+commonEnv:
+  # Host yang boleh dipakai file_url (presigned MinIO), dipisah koma; ".example.internal" = semua subdomain.
+  # Kosong = hanya host yang resolve ke alamat publik, jadi MinIO di jaringan internal ditolak: isi sebelum deploy.
+  FILE_URL_ALLOWED_HOSTS: ""
+  # Endpoint -test untuk load test tim ML (orchestrator /v1/extract-ocr-test, /v1/<tahap>/jobs-test): pipeline
+  # yang sama di tabel testing_*, tanpa callback dan tanpa menulis ke tabel Orkestrasi. Hanya untuk dev.
+  TESTING_ENDPOINTS: "false"
+
+# Tiap service = satu Deployment + satu Service `<release>-<nama>` + satu ConfigMap.
+#   entrypoint : dipanggil dari luar release (Orkestrasi pusat). Ikut di Service gabungan `<release>`
+#                dan NetworkPolicy-nya menerima namespace di networkPolicy.clientNamespaces. Hanya
+#                orchestrator; yang lain internal.
+#   pipeline   : tahap async yang butuh DATABASE_URL dan konfigurasi Orkestrasi.
+#   database   : butuh DATABASE_URL tanpa konfigurasi Orkestrasi (orchestrator: tabel guardrails_results).
+#   rollingUpdate: {maxSurge, maxUnavailable} saat rollout; default 1 / 0 (pod baru siap dulu, tanpa jeda).
+#                Cluster yang tidak punya ruang untuk pod tambahan: 0 / 1 (pod lama dimatikan dulu).
+#   upstreams  : service lain yang dipanggil; chart mengisi <NAMA>_SERVICE_URL dan NetworkPolicy dari sini.
+# Nama service dipakai sebagai nama port Kubernetes: maksimal 15 karakter, huruf kecil/angka, tanpa `-`.
+services:
+  # Pintu masuk tunggal: POST /v1/extract-ocr (cek berkas, hand-off ke extraction, tunggu sampai service
+  # terakhir pipeline_name_sequence) dan GET /v1/extract-ocr/{request_id}. Tanpa callback dan tanpa DB.
+  orchestrator:
+    enabled: true
+    image:
+      repository: ms-bribrain-nilam-ocr-slipgaji-orchestrator
+      tag: ""
+    port: 8034
+    entrypoint: true
+    pipeline: false
+    database: false
+    upstreams: [extraction, structuring, scoring]
+    replicaCount: 2
+    startupFailureThreshold: 15
+    # Satu POST bisa memakan tunggu pipeline (PIPELINE_WAIT_SECONDS) + hand-off; shutdown menunggu
+    # request yang sedang ditahan selesai.
+    terminationGracePeriodSeconds: 60
+    env:
+      # Tunggu pipeline sampai selesai (200 + hasil) sebelum menjawab 202; 0 = tidak menunggu.
+      PIPELINE_WAIT_SECONDS: "15"
+      FIELD_CONFIDENCE_THRESHOLD: "0.5"
+    # Tiap request menahan dokumennya (maks. MAX_UPLOAD_BYTES, 2,5 MB) selama menunggu pipeline.
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+  # ── Ketiga guardrail sebagai service sendiri-sendiri ────────────────────────────────────────
+  # Dipanggil extraction SETELAH OCR, BERSAMAAN, lalu digabung dengan urutan kosong > buram > dokumen
+  # (ocr_common.clients.guardrails). Ketiganya TIDAK punya basis data.
+  #
+  # MEMATIKAN SATU GUARDRAIL: `--set services.guardrail-blur.enabled=false`. Deployment-nya tidak dibuat dan
+  # extraction menerima GUARDRAIL_BLUR_ENABLED=false (enabledEnv di bawah): dua yang lain tetap memutuskan.
+  # Guardrail yang menyala tetapi down dilewati juga (GUARDRAILS_FAIL_OPEN=true di extraction).
+  #
+  # Kunci di sini sama dengan nama folder di services/ dan sufiks nama image, supaya deploy.sh
+  # memakai satu nama untuk build, `--set`, dan `rollout status`. Nama PORT-nya dipendekkan sendiri
+  # ke 15 karakter oleh chart (batas Kubernetes), jadi `guardrail-identity` tidak perlu disingkat
+  # di sini.
+
+  # Halaman kosong. Aturan panjang teks — TIDAK ADA MODEL sama sekali, jadi paling ringan di antara
+  # ketujuh service.
+  guardrail-blank:
+    enabled: true
+    urlEnv: GUARDRAIL_BLANK_URL
+    enabledEnv: GUARDRAIL_BLANK_ENABLED
+    image:
+      repository: ms-bribrain-nilam-ocr-slipgaji-guardrail-blank
+      tag: ""
+    port: 8035
+    entrypoint: false
+    pipeline: false
+    upstreams: []
+    replicaCount: 2
+    startupFailureThreshold: 15
+    terminationGracePeriodSeconds: 30
+    env:
+      BLANK_BACKEND: slip_blank
+      # Teks <= 20 karakter dianggap halaman kosong. Kosong = ambang bawaan model.
+      # BLANK_MAX_CHARS: "20"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+
+  # Mutu halaman. Regresi logistik 6 ciri mutu OCR; tidak membaca satu kata pun.
+  guardrail-blur:
+    enabled: true
+    urlEnv: GUARDRAIL_BLUR_URL
+    enabledEnv: GUARDRAIL_BLUR_ENABLED
+    image:
+      repository: ms-bribrain-nilam-ocr-slipgaji-guardrail-blur
+      tag: ""
+    port: 8036
+    entrypoint: false
+    pipeline: false
+    upstreams: []
+    replicaCount: 2
+    startupFailureThreshold: 15
+    terminationGracePeriodSeconds: 30
+    env:
+      BLUR_BACKEND: slip_blur
+      # Kosong = ambang model (0,9584).
+      # BLUR_THRESHOLD: "0.9584"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 192Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  # Identitas dokumen: slip gaji atau bukan. TF-IDF + tata letak baris, kalibrasi Platt.
+  # Satu-satunya guardrail yang menerima ambang milik Orkestrasi pusat — karena hanya skor inilah
+  # yang berarti P(slip gaji).
+  guardrail-identity:
+    enabled: true
+    urlEnv: GUARDRAIL_IDENTITY_URL
+    enabledEnv: GUARDRAIL_IDENTITY_ENABLED
+    image:
+      repository: ms-bribrain-nilam-ocr-slipgaji-guardrail-identity
+      tag: ""
+    port: 8037
+    entrypoint: false
+    pipeline: false
+    upstreams: []
+    replicaCount: 2
+    startupFailureThreshold: 15
+    terminationGracePeriodSeconds: 30
+    env:
+      IDENTITY_BACKEND: slip_identity
+      # Kosong = ambang model (0,47).
+      # IDENTITY_REJECT_THRESHOLD: "0.47"
+      # IDENTITY_THRESHOLD_URL: http://<orkestrasi-pusat>
+      # IDENTITY_THRESHOLD_PATH: /v1/thresholds/guardrails
+    resources:
+      requests:
+        cpu: 100m
+        memory: 192Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  extraction:
+    enabled: true
+    image:
+      repository: ms-bribrain-nilam-ocr-slipgaji-extraction
+      tag: ""
+    port: 8030
+    entrypoint: false
+    pipeline: true
+    # Ketiga guardrail WAJIB ada di sini: chart mengisi GUARDRAIL_<NAMA>_URL (atau _ENABLED=false bila
+    # guardrail itu dimatikan) dan NetworkPolicy-nya dari daftar ini.
+    upstreams: [guardrail-blank, guardrail-blur, guardrail-identity, structuring]
+    replicaCount: 1
+    startupFailureThreshold: 15
+    env:
+      # `api` (bawaan) = kirim tiap halaman ke layanan OCR paddle6 lewat HTTP; TIDAK ADA model di
+      # dalam image ini. Pilihan lain: `rapidocr` (model ONNX lokal, image jauh lebih besar).
+      # `paddle` BUKAN nama backend yang ada — menuliskannya membuat service menolak start.
+      EXTRACTION_BACKEND: api
+      # WAJIB diisi: dengan EXTRACTION_BACKEND=api, URL kosong membuat service menolak start —
+      # disengaja, karena image ini tidak punya model OCR sendiri. Harus terjangkau dari cluster.
+      EXTRACTION_OCR_URL: ""
+      EXTRACTION_OCR_TIMEOUT_SECONDS: "60"
+      PIPELINE_DRAIN_TIMEOUT_SECONDS: "30"
+      GUARDRAILS_FAIL_OPEN: "true"
+      GUARDRAILS_TIMEOUT_SECONDS: "10"
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+
+  structuring:
+    enabled: true
+    image:
+      repository: ms-bribrain-nilam-ocr-slipgaji-structuring
+      tag: ""
+    port: 8032
+    entrypoint: false
+    pipeline: true
+    upstreams: [scoring]
+    replicaCount: 1
+    startupFailureThreshold: 15
+    env:
+      # `slip_rules`, bukan `slip_gaji_rules` — nama yang tidak ada di registry membuat service
+      # menolak start dengan "Unknown structuring backend".
+      STRUCTURING_BACKEND: slip_rules
+      PIPELINE_DRAIN_TIMEOUT_SECONDS: "30"
+      # Arbitrase nilai uang lewat LLM. Mati secara default: service harus bisa berjalan tanpa
+      # kredensial. Terukur di 50 dokumen berlabel: aturan saja 81,5% field benar, dengan
+      # arbitrase 89,9%. Menyalakannya butuh rahasia tambahan (lihat secretKeys di atas).
+      ENABLE_LLM: "false"
+      # SIAPA yang menjawab dan DI MANA. Kosong = pakai config.yaml bawaan image (bedrock).
+      # Untuk memindahkan beban ke gateway di dalam VPC, tanpa federasi AWS sama sekali:
+      # LLM_BACKEND: http
+      # LLM_ENDPOINT: http://<gateway>/v1/chat/completions
+      # LLM_MODEL: <nama model>
+      # LLM_API_KEY_ENV: nama VARIABEL yang memuat kuncinya, bukan kuncinya
+      #
+      # DARI MANA prompt dibaca. Teksnya tidak pernah ada di kode atau setelan; ini penunjuknya.
+      #   file (bawaan): /app/prompts/slip_gaji.v1.md di dalam image, atau PROMPT_PATH (ConfigMap/volume).
+      #   db: baris tabel `prompts` (migrasi 0010); PROMPT_VERSION kosong = baris active terbaru.
+      PROMPT_SOURCE: file
+      # PROMPT_NAME: slip_gaji
+      # PROMPT_VERSION: "1"
+      # PROMPT_PATH: /etc/prompts/slip_gaji.v2.md
+      # PROMPT_DB_FALLBACK_TO_FILE: "true"
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+
+  scoring:
+    enabled: true
+    image:
+      repository: ms-bribrain-nilam-ocr-slipgaji-scoring
+      tag: ""
+    port: 8033
+    entrypoint: false
+    pipeline: true
+    upstreams: []
+    replicaCount: 1
+    startupFailureThreshold: 15
+    env:
+      PIPELINE_DRAIN_TIMEOUT_SECONDS: "30"
+      SCORING_BACKEND: conf_v2
+      FIELD_CONFIDENCE_THRESHOLD: "0.5"
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+
+service:
+  type: ClusterIP
+  annotations: {}
+  # Service gabungan bernama `<release>` yang membuka port semua service ber-entrypoint (hanya
+  # orchestrator, 8034). Ini alamat yang dipublikasikan ke Orkestrasi pusat (integration.md); internal
+  # pipeline memakai Service per komponen.
+  entrypoint:
+    enabled: true
+
+# Ingress default-deny untuk semua pod release; tiap service hanya menerima dari pemanggilnya
+# (dihitung dari upstreams). Service ber-entrypoint menerima dari clientNamespaces dan dari semua
+# pod release. Egress belum dibatasi. Cluster tanpa enforcement
+# (GKE tanpa Dataplane V2 / Calico) mengabaikan policy ini diam-diam.
+networkPolicy:
+  enabled: true
+  clientNamespaces: []
+
+# maxUnavailable, bukan minAvailable: minAvailable 1 menahan upgrade node saat replika 1.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+serviceAccount:
+  create: true
+  name: ""
+  # Workload Identity: iam.gke.io/gcp-service-account: <gsa>@<project>.iam.gserviceaccount.com
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]

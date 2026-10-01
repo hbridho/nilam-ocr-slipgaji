@@ -1,0 +1,54 @@
+# GKE dev (gc-ddb-dev-gke-cluster-01, namespace nilam-ocr-slipgaji). Placeholder di bawah dikonfirmasi tim
+# deploy: registry, alamat layanan OCR, endpoint callback Orkestrasi, namespace klien.
+environment: dev
+
+image:
+  # Diisi CI / tim deploy dengan SHA commit (--set image.tag=<sha>); kosong = Chart.appVersion.
+  tag: ""
+
+existingSecret: nilam-ocr-slipgaji-secrets
+
+orchestration:
+  # Callback hasil ke Orkestrasi (endpoint dari tim Orkestrasi, 24 Sep 2026): satu POST per request
+  # saat selesai, dengan X-Callback-Key = ORCHESTRATION_CALLBACK_KEY di Secret nilam-ocr-slipgaji-secrets.
+  # Key itu WAJIB ada di Secret sebelum deploy: tanpa key, extraction/structuring/scoring menolak start.
+  url: http://ocr-orchestration.ocr-dev.svc.cluster.local
+  callbackPath: /v1/ocr-callback
+  callbackFormat: result
+
+commonEnv:
+  # Double write: selain tabel job kita sendiri, keadaan akhir tiap request (COMPLETED dari scoring,
+  # FAILED dari tahap mana pun) ditambahkan sebagai baris GET_OCR_RESULT di log API Orkestrasi,
+  # karena Orkestrasi membaca hasil dari tabel itu, bukan dari GET /v1/scoring/jobs/{request_id}.
+  ORCHESTRATION_API_EVENTS_TABLE: ocr.orchestration_api_events
+  # Outbox transaksional: hand-off dan callback ditulis ke pipeline_outbox bersama hasil job, lalu dikirim
+  # relay dengan backoff (sampai 5 menit sekali, selama 24 jam), jadi tidak hilang saat pod restart atau
+  # penerima down. Dinyalakan di cluster 24 Sep 2026.
+  PIPELINE_OUTBOX: "true"
+  # Load test tim ML lewat kubectl port-forward ke orchestrator, /v1/extract-ocr-test. Butuh migrasi 0006
+  # (tabel testing_*). Lihat README, "Endpoint testing".
+  TESTING_ENDPOINTS: "true"
+
+networkPolicy:
+  # Namespace Orkestrasi di cluster dev. Cluster ini memakai LEGACY_DATAPATH tanpa
+  # network policy enforcement, jadi policy hanya terpasang, belum ditegakkan.
+  clientNamespaces: [ocr-dev]
+
+services:
+  extraction:
+    env:
+      EXTRACTION_OCR_URL: http://10.213.128.67:8070
+
+# Node l5uf di cluster dev rusak tetapi tetap Ready dan menerima pod (29 Sep 2026): sandbox pod baru tidak
+# pernah dibuat (FailedCreatePodSandBox DeadlineExceeded) dan pod tim lain macet Terminating di sana. Pod
+# scoring dan structuring yang dijadwalkan ke node itu tidak pernah menyala, jadi helm --wait menunggu sampai
+# dibatalkan. Node itu milik cluster bersama, jadi pod kita saja yang menghindarinya. Hapus blok ini setelah
+# node diganti.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: NotIn
+              values: [gke-gc-ddb-dev-gke-c-gc-dgv-dev-ndp-c-42b3b8a0-l5uf]

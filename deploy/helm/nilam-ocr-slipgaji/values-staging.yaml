@@ -1,0 +1,27 @@
+# Staging. Every <...> is filled by the deploying team; nothing here is a secret (secrets come from the
+# Secret `existingSecret`, see deploy/DEPLOY.md).
+environment: staging
+
+image:
+  registry: <artifact-registry>/<project>/<repo>
+  tag: ""   # --set image.tag=<git sha> at deploy time
+
+existingSecret: nilam-ocr-slipgaji-secrets
+
+orchestration:
+  url: <http://ocr-orchestration.<namespace>.svc.cluster.local>
+  callbackPath: /v1/ocr-callback
+  callbackFormat: result
+
+commonEnv:
+  PIPELINE_OUTBOX: "true"
+  FILE_URL_ALLOWED_HOSTS: <minio host, comma separated>
+  TESTING_ENDPOINTS: "false"
+
+networkPolicy:
+  clientNamespaces: [<namespace of the central orchestrator>]
+
+services:
+  extraction:
+    env:
+      EXTRACTION_OCR_URL: <http://paddle-ocr-service:port>

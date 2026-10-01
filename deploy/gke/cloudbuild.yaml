@@ -1,0 +1,114 @@
+# Build ketujuh image di Cloud Build, lalu push ke Artifact Registry.
+#
+# Dipakai lewat scripts/build_cloud.py, yang mengisi substitusi dan memeriksa prasyaratnya. Manual:
+#
+#   gcloud builds submit --config deploy/gke/cloudbuild.yaml \
+#     --substitutions=_TAG=$(git rev-parse --short HEAD)
+#
+# KENAPA BUKAN `gcloud builds submit --tag`. Bentuk itu mengasumsikan satu `Dockerfile` di akar
+# context. Di sini ada tujuh, di services/<nama>/Dockerfile, dan semuanya memakai AKAR REPO
+# sebagai context (mereka menyalin libs/). Jadi langkahnya ditulis sendiri dengan `-f`.
+#
+# Ketujuh build berjalan BERSAMAAN (`waitFor: ['-']`). Lapisan awalnya tidak sama — tiap service
+# punya requirements.lock sendiri — jadi menjalankannya berurutan tidak menghemat apa pun.
+
+substitutions:
+  _REGISTRY: asia-southeast2-docker.pkg.dev/common-cicd-dev-01/gc-bribrain-dev-gar-temp-01
+  _PREFIX: ms-bribrain-nilam-ocr-slipgaji
+  _TAG: latest
+
+options:
+  # Tujuh docker build sekaligus. Mesin bawaan (1 vCPU) membuatnya saling berebut.
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 2400s
+
+steps:
+  - id: orchestrator
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - -f
+      - services/orchestrator/Dockerfile
+      - -t
+      - ${_REGISTRY}/${_PREFIX}-orchestrator:${_TAG}
+      - .
+
+  - id: guardrail-blank
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - -f
+      - services/guardrail-blank/Dockerfile
+      - -t
+      - ${_REGISTRY}/${_PREFIX}-guardrail-blank:${_TAG}
+      - .
+
+  - id: guardrail-blur
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - -f
+      - services/guardrail-blur/Dockerfile
+      - -t
+      - ${_REGISTRY}/${_PREFIX}-guardrail-blur:${_TAG}
+      - .
+
+  - id: guardrail-identity
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - -f
+      - services/guardrail-identity/Dockerfile
+      - -t
+      - ${_REGISTRY}/${_PREFIX}-guardrail-identity:${_TAG}
+      - .
+
+  - id: extraction
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - -f
+      - services/extraction/Dockerfile
+      - -t
+      - ${_REGISTRY}/${_PREFIX}-extraction:${_TAG}
+      - .
+
+  - id: structuring
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - -f
+      - services/structuring/Dockerfile
+      - -t
+      - ${_REGISTRY}/${_PREFIX}-structuring:${_TAG}
+      - .
+
+  - id: scoring
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - -f
+      - services/scoring/Dockerfile
+      - -t
+      - ${_REGISTRY}/${_PREFIX}-scoring:${_TAG}
+      - .
+
+# Cloud Build yang mem-push, setelah SEMUA langkah di atas berhasil. Jadi satu build yang gagal
+# berarti tidak ada satu pun image yang terdorong — tidak ada release yang separuh terisi.
+images:
+  - ${_REGISTRY}/${_PREFIX}-orchestrator:${_TAG}
+  - ${_REGISTRY}/${_PREFIX}-guardrail-blank:${_TAG}
+  - ${_REGISTRY}/${_PREFIX}-guardrail-blur:${_TAG}
+  - ${_REGISTRY}/${_PREFIX}-guardrail-identity:${_TAG}
+  - ${_REGISTRY}/${_PREFIX}-extraction:${_TAG}
+  - ${_REGISTRY}/${_PREFIX}-structuring:${_TAG}
+  - ${_REGISTRY}/${_PREFIX}-scoring:${_TAG}
