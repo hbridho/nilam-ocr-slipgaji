@@ -1,0 +1,1725 @@
+openapi: 3.1.0
+info:
+  title: OCR Slip Gaji Scoring API
+  description: 'Tahap terakhir pipeline slip gaji: memberi **skor keyakinan per field** — P(nilai ini
+    benar), 0-1, terkalibrasi isotonic.
+
+
+    Modelnya regresi logistik 9 variabel + one-hot field, dilatih pada 1.428 nilai dari 50 dokumen berlabel;
+    out-of-fold AUC 0,826 · Gini 0,652 · ECE 0,037. Pada ambang 80: precision 93,4%, recall 75,6%.
+
+
+    **Tidak ada keputusan di sini.** Skor mentah yang dikembalikan; pemetaan ke `confidence` 0/1 terjadi
+    di kontrak `extract-ocr`, supaya ambangnya bisa diubah tanpa melatih ulang apa pun.
+
+
+    **Pipeline asinkron:** service structuring POST /v1/scoring/jobs dan menerima 202; service ini memberi
+    skor di latar, menyimpan hasilnya, dan mengirim callback berisi hasil akhir ke orchestrator. /v1/scoring/score
+    melakukan pekerjaan yang sama secara sinkron. Semua endpoint kecuali /health memerlukan header X-API-Key.
+
+
+    ## Conventions (the same for every nilam-ocr service)
+
+
+    **Authentication.** Every endpoint except `/health`, `/ready` and `/metrics` requires the header `X-API-Key`.
+
+    A missing or wrong key answers `401`. The services are reachable only from inside the cluster.
+
+
+    **Envelope.** Every JSON response, success or error, has the same shape:
+
+    `{status_code, status_desc, message, data, errors, request_id}`. `status_code` always equals the HTTP
+
+    status. On success `errors` is null; on error `data` is null.
+
+
+    **Errors.** `errors` is a stable, machine-readable code; branch on it, not on the wording of `message`.
+
+    The document checks: `EMPTY_FILE`, `UNSUPPORTED_FILE_TYPE`, `UNREADABLE_FILE`, `TOO_MANY_PAGES`,
+
+    `INVALID_FILE_SOURCE`, `FILE_URL_REJECTED` (400), `FILE_TOO_LARGE` (413). Otherwise the code of the
+    status:
+
+    `UNAUTHORIZED` (401), `REQUEST_ID_NOT_FOUND` (404, an unknown request_id), `NOT_FOUND` (404, a path
+    that does
+
+    not exist), `METHOD_NOT_ALLOWED` (405), `VALIDATION_ERROR` (422), `INTERNAL_SERVER_ERROR` (500),
+
+    `DOWNSTREAM_UNAVAILABLE` (503), `DOWNSTREAM_TIMEOUT` (504), unless an endpoint documents a more precise
+    one.
+
+    `400` = the request or the document is unusable (do not retry unchanged). `503` / `504` are safe to
+    retry.
+
+
+    **request_id.** Minted by the central orchestrator and carried through every stage. Where an endpoint
+    has
+
+    no request_id of its own, the `X-Request-ID` request header is used (and echoed in the response header);
+
+    without it the service generates one.
+
+
+    **Asynchronous stages** (internal: only the orchestrator SLIP_GAJI and the previous stage call them).
+    `POST
+
+    .../jobs` answers `202` immediately and does the work in the background. The outcome is reported by
+    a
+
+    callback to the central orchestrator (see *Webhooks*), and can be read at any time with
+
+    `GET .../jobs/{request_id}`, which the orchestrator SLIP_GAJI''s `GET /v1/extract-ocr/{request_id}`
+    combines
+
+    over the three stages. Submitting the same request_id again is idempotent:
+
+    `202` with `duplicate: true`, the work is not repeated, unless the earlier attempt `FAILED` or has
+    been
+
+    `PROCESSING` for longer than the job lease (`PIPELINE_JOB_LEASE_SECONDS`, 5 minutes by default: the
+
+    process running it died). A job still running when the service shuts down is reported `FAILED`. Because
+
+    the request was already answered `202`, a problem with the document itself (unreadable file, no text,
+
+    unsupported document type) shows up as a `FAILED` job and callback, not as a `4xx`.
+
+    '
+  version: 1.0.0
+servers:
+- url: /
+  description: This host (where this page is served)
+- url: http://ms-bribrain-nilam-ocr-slipgaji-scoring.{namespace}.svc.cluster.local:8033
+  description: GKE, from inside the release's namespace (the other services of this pipeline)
+  variables:
+    namespace:
+      default: ms-bribrain-nilam-ocr-slipgaji
+      description: 'Namespace of the Helm release (deploy/helm/deploy.sh: nilam-ocr-slipgaji)'
+- url: http://scoring:8033
+  description: The Docker Compose network
+- url: http://127.0.0.1:8033
+  description: Local development
+paths:
+  /health:
+    get:
+      tags:
+      - Health
+      summary: Health check, including the database
+      description: 'Says whether the service can reach what it depends on: 200 `healthy` when every dependency
+        it checks answers (the database, for a service that has one), 503 `unhealthy` with the cause in
+        `detail` otherwise. Each check gives up after 3 s. Also lists the active implementations (`backends`).
+        Not used by the Kubernetes probes: liveness and startup check the port, readiness is `/ready`.
+        Does not require an API key.'
+      operationId: getHealth
+      responses:
+        '200':
+          description: Every dependency answers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                healthy:
+                  summary: Healthy
+                  value:
+                    status: healthy
+                    version: 1.0.0
+                    device: cpu
+                    backends:
+                      scoring: conf_v2
+                      storage: postgres
+        '503':
+          description: A dependency does not answer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: unhealthy
+                version: 1.0.0
+                detail: database unreachable
+                device: cpu
+                backends:
+                  scoring: conf_v2
+                  storage: postgres
+  /ready:
+    get:
+      tags:
+      - Health
+      summary: Readiness probe
+      description: 'The readiness probe. Liveness is checked on the port, never on a dependency (a database
+        blip must not make Kubernetes restart every pod). /ready says whether this pod can do its job
+        right now: 200 when every REQUIRED dependency of this service answers, 503 otherwise, so the pod
+        is taken out of the Service until it recovers. Downstream stages and model services are deliberately
+        not checked: their outage is reported per job, not by refusing traffic. Does not require an API
+        key.'
+      operationId: getReadiness
+      responses:
+        '200':
+          description: Every required dependency answers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              examples:
+                ready:
+                  summary: Ready
+                  value:
+                    status: ready
+                    checks:
+                      database: ok
+        '503':
+          description: A required dependency is unavailable; the pod is taken out of the Service
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              example:
+                status: not_ready
+                checks:
+                  database: failed
+  /metrics:
+    get:
+      tags:
+      - Health
+      summary: Prometheus metrics
+      description: 'Prometheus text exposition of this process: `http_requests_total` and `http_request_duration_seconds`
+        per route template, and for the pipeline stages `pipeline_jobs_total` (by outcome), `pipeline_job_duration_seconds`,
+        `pipeline_stale_jobs_reclaimed_total`, `pipeline_outbox_deliveries_total` and the outbox backlog
+        gauges (`pipeline_outbox_pending`, `_retrying`, `_dead_letters`, `_oldest_pending_seconds`). Scraped
+        inside the cluster; does not require an API key.'
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Metrics in the Prometheus text format
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/scoring/jobs:
+    post:
+      tags:
+      - Pipeline
+      summary: Serahkan dokumen terstruktur ke tahap scoring (terakhir)
+      description: '**Langkah 3 pipeline, asinkron, tahap terakhir. Dipanggil service structuring, bukan
+        orchestrator.**
+
+
+        Mencatat job (`scoring_jobs`, idempoten per request_id), menjawab **202 seketika**, lalu di latar:
+        memberi skor keyakinan pada setiap field tiap slip, menyimpan hasilnya (`scoring_results`), dan
+        mengirim callback `SCORING` yang membawa **hasil akhir** permintaan ini.
+
+
+        Keluarannya skor 0-1 per field. Tidak ada skor tingkat dokumen dan tidak ada keputusan terima
+        / tolak: ambang milik orchestrator.'
+      operationId: submitScoringJob
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScoringJobRequest'
+        required: true
+      responses:
+        '202':
+          description: The job was accepted (or already existed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobAcceptedResponse'
+              examples:
+                accepted:
+                  summary: New job
+                  value:
+                    status_code: 202
+                    status_desc: Accepted
+                    message: Accepted
+                    data:
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      stage: SCORING
+                      status: PROCESSING
+                      duplicate: false
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                duplicate:
+                  summary: 'Same request_id sent again: nothing is re-run'
+                  value:
+                    status_code: 202
+                    status_desc: Accepted
+                    message: Accepted
+                    data:
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      stage: SCORING
+                      status: DONE
+                      duplicate: true
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: scoring
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'body.request_id: Field required'
+                errors: VALIDATION_ERROR
+                pipeline_last_stage: scoring
+      security:
+      - APIKeyHeader: []
+  /v1/scoring/jobs/{request_id}:
+    get:
+      tags:
+      - Pipeline
+      summary: Status and result of the scoring stage
+      description: 'Status of this stage only and, once `DONE`, the two confidences plus the exact payload
+        that was scored. Internal: the orchestrator Slip Gaji reads it (while it waits, and for its `GET
+        /v1/extract-ocr/{request_id}`); the central orchestrator receives the final result in the callback.
+        Also useful to audit a score.'
+      operationId: getScoringJob
+      security:
+      - APIKeyHeader: []
+      parameters:
+      - name: request_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Request Id
+      responses:
+        '200':
+          description: The job exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoringJobStatusResponse'
+              examples:
+                done:
+                  summary: Finished
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      stage: SCORING
+                      created_at: '2026-09-18T04:00:01+00:00'
+                      status: DONE
+                      result:
+                        slips:
+                        - slip_no: 1
+                          scores:
+                            nama_karyawan: 76.71
+                            jabatan: 76.71
+                            gaji_pokok: 93.6
+                            tunjangan_makan: 88.89
+                            total_pendapatan: 92.47
+                            gaji_bersih: 92.47
+                        threshold: 80.0
+                        model: conf_v2
+                      updated_at: '2026-09-18T04:00:01+00:00'
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                failed:
+                  summary: Failed
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      stage: SCORING
+                      created_at: '2026-09-18T04:00:01+00:00'
+                      status: FAILED
+                      error_message: 'Unsupported document_type: ktp. Supported: [''slip_gaji'']'
+                      updated_at: '2026-09-18T04:00:01+00:00'
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: scoring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No scoring job for this request_id
+          content:
+            application/json:
+              example:
+                status_code: 404
+                status_desc: Not Found
+                message: 'No SCORING job found for request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0'
+                errors: 'No SCORING job found for request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0'
+                request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                pipeline_last_stage: scoring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'path.request_id: Field required'
+                errors: VALIDATION_ERROR
+                request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                pipeline_last_stage: scoring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/scoring/outbox:
+    get:
+      tags:
+      - Pipeline
+      summary: Backlog of this stage's undelivered callbacks and hand-offs
+      description: 'Operational view of the transactional outbox (`PIPELINE_OUTBOX`): how many callbacks
+        and hand-offs of this stage are still to be delivered, how old the oldest one is, and how many
+        were given up on (dead letters). No other service watches the `pipeline_outbox` table, so this
+        is where a monitor should look; the relay also logs a warning when the backlog is older than `PIPELINE_OUTBOX_STALE_AFTER_SECONDS`
+        or a dead letter is waiting.'
+      operationId: getScoringOutboxStatus
+      responses:
+        '200':
+          description: The backlog of this stage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboxStatusResponse'
+              examples:
+                idle:
+                  summary: Nothing waiting
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      enabled: true
+                      stage: SCORING
+                      pending: 0
+                      retrying: 0
+                      dead_letters: 0
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                backlog:
+                  summary: The orchestrator has been down for a while
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      enabled: true
+                      stage: SCORING
+                      pending: 12
+                      retrying: 12
+                      oldest_pending_seconds: 754.3
+                      dead_letters: 1
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                disabled:
+                  summary: '`PIPELINE_OUTBOX` is off'
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      enabled: false
+                      stage: SCORING
+                      pending: 0
+                      retrying: 0
+                      dead_letters: 0
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: scoring
+      security:
+      - APIKeyHeader: []
+  /v1/scoring/outbox/release:
+    post:
+      tags:
+      - Pipeline
+      summary: Send this stage's dead letters again
+      description: 'Puts the dead letters of this stage back in the outbox queue, due immediately, so
+        the relay delivers them again: use it after the receiver was fixed (for example the orchestrator''s
+        callback contract, or a next stage that was answering 4xx). Optional query `request_id` limits
+        it to one request. A message that fails again goes through the same retry and dead-letter rules.
+        `409` when `PIPELINE_OUTBOX` is off on this service.'
+      operationId: releaseScoringOutbox
+      security:
+      - APIKeyHeader: []
+      parameters:
+      - name: request_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+      responses:
+        '200':
+          description: Dead letters released
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboxReleaseResponse'
+              examples:
+                released:
+                  summary: One request
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      stage: SCORING
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      released: 1
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                nothing:
+                  summary: Nothing to release
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      stage: SCORING
+                      released: 0
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: scoring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: The outbox is off on this service
+          content:
+            application/json:
+              example:
+                status_code: 409
+                status_desc: Conflict
+                message: 'PIPELINE_OUTBOX is off: there is no outbox to release'
+                errors: 'PIPELINE_OUTBOX is off: there is no outbox to release'
+                pipeline_last_stage: scoring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'query.request_id: Input should be a valid string'
+                errors: VALIDATION_ERROR
+                pipeline_last_stage: scoring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/scoring/score:
+    post:
+      tags:
+      - Scoring
+      summary: Skor keyakinan per field, sinkron (tanpa job, tanpa callback)
+      description: 'Menghitung **P(nilai field ini benar)** untuk setiap nilai yang diextraction, sebagai
+        skor 0-1 yang sudah dikalibrasi (isotonic), lalu dikembalikan apa adanya.
+
+
+        Modelnya regresi logistik atas 9 variabel + one-hot field: kesepakatan regex vs LLM, jarak nominal
+        ke median field, seberapa sering field ini benar-benar ada, jumlah digit, hasil cek aritmetika,
+        nilai nol, dan porsi kotak OCR berskor rendah di halaman. Dilatih pada 1.428 nilai dari 50 dokumen
+        berlabel; out-of-fold (GroupKFold per dokumen): AUC 0,826 · Gini 0,652 · ECE 0,037.
+
+
+        **Tidak ada keputusan di sini.** Pemetaan ke `confidence` 0/1 terjadi di kontrak `extract-ocr`
+        memakai `threshold`, supaya ambangnya bisa diubah tanpa melatih ulang apa pun. Pada ambang 80:
+        precision 93,4%, recall 75,6%.
+
+
+        Field tanpa nilai tidak diberi skor: tidak ada yang perlu dinilai di sana, dan memberinya 0 akan
+        tercampur dengan nilai yang benar-benar diragukan.'
+      operationId: scoreSlips
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScoreRequest'
+        required: true
+      responses:
+        '200':
+          description: Skor untuk tiap slip
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoreResponse'
+              examples:
+                satu_slip:
+                  summary: Satu slip
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      slips:
+                      - slip_no: 1
+                        scores:
+                          nama_karyawan: 76.71
+                          jabatan: 76.71
+                          gaji_pokok: 93.6
+                          tunjangan_makan: 88.89
+                          total_pendapatan: 92.47
+                          gaji_bersih: 92.47
+                      threshold: 80.0
+                      model: conf_v2
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '400':
+          description: Tidak ada slip untuk dinilai
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 400
+                status_desc: Bad Request
+                message: tidak ada slip untuk dinilai
+                errors: tidak ada slip untuk dinilai
+                pipeline_last_stage: scoring
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: scoring
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'body.slips: Field required'
+                errors: VALIDATION_ERROR
+                pipeline_last_stage: scoring
+        '500':
+          description: Model keyakinan gagal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 500
+                status_desc: Internal Server Error
+                message: Internal error in SCORING stage
+                errors: Internal error in SCORING stage
+                pipeline_last_stage: scoring
+      security:
+      - APIKeyHeader: []
+webhooks:
+  stageCallback:
+    post:
+      tags:
+      - Callbacks
+      summary: Stage status callback (implemented by the orchestrator / gateway)
+      description: '**This is a request this service SENDS, not one it accepts.** The orchestrator must
+        expose it.
+
+
+        `POST {ORCHESTRATION_URL}{ORCHESTRATION_CALLBACK_PATH}` (default path `/v1/callbacks/stage`),
+        `Content-Type: application/json`.
+
+
+        **When.** Once per job of `POST /v1/scoring/jobs`, the last callback of a request: `stage: SCORING`
+        with `status: DONE` and `result` = the **final result** (fields, per-field confidences, and the
+        guardrails result that was submitted), or `status: FAILED` with `error_message` and `result: null`.
+
+
+        **Expected answer.** Any `2xx`; the body is ignored. `5xx`, a timeout or an unreachable host are
+        retried (3 attempts by default, exponential back-off from 0.5 s). A `4xx` is NOT retried. A callback
+        that still fails is logged and dropped: the job itself stays `DONE` / `FAILED`, so the orchestrator
+        can reconcile with the orchestrator SLIP_GAJI''s `GET /v1/extract-ocr/{request_id}` and should
+        time a request out on its own. With `PIPELINE_OUTBOX` the callback is instead queued in the same
+        transaction as the result and retried with back-off (up to 5 minutes apart) for up to `PIPELINE_OUTBOX_MAX_AGE_SECONDS`
+        (24 h by default); a `4xx`, or that age, makes it a dead letter that stays in the table and is
+        counted by `GET .../outbox`.
+
+
+        **What the receiver must tolerate.** The same callback may arrive more than once (treat it as
+        idempotent), and callbacks of different stages come from different services, so they may arrive
+        out of order: only ever move a request''s status forward. Reject callbacks whose `X-API-Key` is
+        wrong.'
+      operationId: stageCallback
+      parameters:
+      - description: '`ORCHESTRATION_API_KEY` of the sending service; when unset, that service''s own
+          `API_KEY`'
+        required: true
+        schema:
+          type: string
+          title: X-Api-Key
+          description: '`ORCHESTRATION_API_KEY` of the sending service; when unset, that service''s own
+            `API_KEY`'
+        name: x-api-key
+        in: header
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScoringStageCallback'
+        required: true
+      responses:
+        '200':
+          description: Acknowledged. Any 2xx is accepted and the body is ignored.
+          content:
+            application/json:
+              schema: {}
+components:
+  schemas:
+    ErrorResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          examples:
+          - 400
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          examples:
+          - Bad Request
+        message:
+          type: string
+          title: Message
+          description: Human-readable cause; safe to log
+          examples:
+          - Uploaded file is empty
+        data:
+          type: 'null'
+          title: Data
+          description: Always null on error
+        errors:
+          type: string
+          title: Errors
+          description: Machine-readable cause. `VALIDATION_ERROR` for 422 (branch on this, the message
+            names a different field every time); for every other status it repeats `message`
+          examples:
+          - Uploaded file is empty
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: Present when the error is tied to a known request_id
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+      type: object
+      required:
+      - status_code
+      - status_desc
+      - message
+      - errors
+      title: ErrorResponse
+      description: Every error response.
+    FinalResult:
+      properties:
+        document_type:
+          type: string
+          title: Document Type
+          description: Jenis dokumen
+          examples:
+          - slip_gaji
+        total_slip:
+          type: integer
+          minimum: 0.0
+          title: Total Slip
+          description: Jumlah slip di dokumen ini
+          examples:
+          - 3
+        slips:
+          items:
+            $ref: '#/components/schemas/FinalSlip'
+          type: array
+          title: Slips
+          description: Satu entri per slip. Probabilitas 0-1 dibiarkan apa adanya di sini; pemetaan ke
+            confidence 0/1 terjadi di kontrak `extract-ocr`, supaya ambangnya bisa diubah tanpa melatih
+            ulang apa pun
+        guardrails:
+          anyOf:
+          - $ref: '#/components/schemas/GuardrailsPayload'
+          - type: 'null'
+          description: Laporan guardrail dari tahap OCR, dikembalikan apa adanya
+        llm_used:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Llm Used
+          description: true bila arbitrase LLM dipakai saat structuring
+      type: object
+      required:
+      - document_type
+      - total_slip
+      - slips
+      title: FinalResult
+      description: Apa yang dihasilkan pipeline untuk satu request_id. Dibawa callback SCORING / DONE.
+    FinalSlip:
+      properties:
+        slip_no:
+          type: integer
+          minimum: 1.0
+          title: Slip No
+          examples:
+          - 1
+        page:
+          anyOf:
+          - type: integer
+            minimum: 1.0
+          - type: 'null'
+          title: Page
+          examples:
+          - 1
+        fields:
+          additionalProperties: true
+          type: object
+          title: Fields
+          description: 20 field; null bila tidak ditemukan
+        scores:
+          additionalProperties:
+            type: number
+          type: object
+          title: Scores
+          description: Probabilitas 0-1 per field yang ada nilainya
+        missing_mandatory_fields:
+          items:
+            type: string
+          type: array
+          title: Missing Mandatory Fields
+      type: object
+      required:
+      - slip_no
+      - fields
+      title: FinalSlip
+      description: Satu slip pada hasil akhir.
+    GuardrailsDocument:
+      properties:
+        verdict:
+          anyOf:
+          - type: string
+            enum:
+            - accepted
+            - reject
+            - skipped
+          - type: 'null'
+          title: Verdict
+          description: Putusan dokumen
+          examples:
+          - accepted
+        confidence:
+          anyOf:
+          - type: number
+            maximum: 1.0
+            minimum: 0.0
+          - type: 'null'
+          title: Confidence
+          description: 'Lolos: P(slip gaji). Ditolak: keyakinan pada penolakan'
+          examples:
+          - 0.9934
+        n_pages:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: N Pages
+          description: Halaman yang dinilai
+          examples:
+          - 3
+        threshold:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Threshold
+          description: Ambang yang dipakai pemeriksaan penentu
+          examples:
+          - 0.47
+        threshold_target:
+          anyOf:
+          - type: string
+            enum:
+            - accept
+            - reject
+          - type: 'null'
+          title: Threshold Target
+          description: Sisi ambang
+      additionalProperties: true
+      type: object
+      title: GuardrailsDocument
+      description: Putusan guardrail untuk dokumen ini (bentuk API spec [07]).
+    GuardrailsPayload:
+      properties:
+        passed:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Passed
+          description: 'true: dokumen boleh lanjut ke structuring'
+          examples:
+          - true
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reason
+          description: Alasan ditahan; null bila lolos
+          examples:
+          - null
+        verdict:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Verdict
+          description: Putusan gabungan
+          examples:
+          - slip_gaji
+        skipped:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Skipped
+          description: Guardrail yang dimatikan (`GUARDRAIL_<NAMA>_ENABLED=false`)
+          examples:
+          - []
+        unavailable:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Unavailable
+          description: Guardrail yang menyala tetapi tidak menjawab (dilewati, fail-open)
+          examples:
+          - []
+        skipped_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Skipped Reason
+          description: Kenapa tidak ada putusan
+        document:
+          anyOf:
+          - $ref: '#/components/schemas/GuardrailsDocument'
+          - type: 'null'
+      additionalProperties: true
+      type: object
+      title: GuardrailsPayload
+      description: Laporan gabungan ketiga guardrail (guardrail-blank, guardrail-blur, guardrail-identity),
+        dihasilkan tahap OCR karena modelnya membaca teks OCR, lalu diteruskan tanpa diubah ke structuring
+        dan scoring.
+    HealthResponse:
+      properties:
+        status:
+          type: string
+          title: Status
+          description: '`healthy` (HTTP 200) or `unhealthy` (HTTP 503)'
+          examples:
+          - healthy
+        version:
+          type: string
+          title: Version
+          description: Service version
+          examples:
+          - 1.0.0
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Detail
+          description: The cause when `unhealthy`; null when healthy
+          examples:
+          - null
+        device:
+          type: string
+          title: Device
+          description: Where this service computes
+          examples:
+          - cpu
+        backends:
+          additionalProperties:
+            type: string
+          type: object
+          title: Backends
+          description: Active implementation per concern (model backend, storage). Useful to confirm a
+            deployment
+          examples:
+          - ekstraksi: paddle
+            storage: postgres
+      type: object
+      required:
+      - status
+      - version
+      - device
+      - backends
+      title: HealthResponse
+      description: '`GET /health`.'
+    JobAccepted:
+      properties:
+        request_id:
+          type: string
+          title: Request Id
+          description: Echo of the submitted request_id
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        stage:
+          type: string
+          enum:
+          - OCR
+          - STRUCTURING
+          - SCORING
+          title: Stage
+          description: Pipeline stage that accepted the job
+          examples:
+          - OCR
+        status:
+          type: string
+          enum:
+          - PROCESSING
+          - DONE
+          - FAILED
+          title: Status
+          description: '`PROCESSING` for a newly accepted job. When `duplicate` is true: the current status
+            of the job that already exists for this request_id'
+          examples:
+          - PROCESSING
+        duplicate:
+          type: boolean
+          title: Duplicate
+          description: 'true: this request_id was already accepted before and the work is NOT run again
+            (idempotent). Exception: a job whose status is `FAILED` is re-claimed and run again, and answers
+            `duplicate: false`'
+          default: false
+          examples:
+          - false
+      type: object
+      required:
+      - request_id
+      - stage
+      - status
+      title: JobAccepted
+      description: '`data` of `POST /v1/<stage>/jobs`.'
+    JobAcceptedResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 202
+          examples:
+          - 202
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: Accepted
+          examples:
+          - Accepted
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Accepted
+          examples:
+          - Accepted
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/JobAccepted'
+      type: object
+      required:
+      - data
+      title: JobAcceptedResponse
+      description: Envelope of `POST /v1/<stage>/jobs`.
+    OutboxRelease:
+      properties:
+        stage:
+          type: string
+          enum:
+          - OCR
+          - STRUCTURING
+          - SCORING
+          title: Stage
+          description: The stage whose dead letters were released
+          examples:
+          - OCR
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: Only this request's dead letters were released; null = every dead letter of the
+            stage
+        released:
+          type: integer
+          title: Released
+          description: Dead letters put back in the queue, due immediately
+          examples:
+          - 1
+      type: object
+      required:
+      - stage
+      - released
+      title: OutboxRelease
+      description: The `data` of `POST /v1/<stage>/outbox/release`.
+    OutboxReleaseResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 200
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: OK
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Success
+          examples:
+          - Success
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/OutboxRelease'
+      type: object
+      required:
+      - data
+      title: OutboxReleaseResponse
+      description: Envelope of `POST /v1/<stage>/outbox/release`.
+    OutboxStatus:
+      properties:
+        enabled:
+          type: boolean
+          title: Enabled
+          description: 'false when `PIPELINE_OUTBOX` is off: callbacks are sent directly and nothing is
+            queued'
+        stage:
+          type: string
+          enum:
+          - OCR
+          - STRUCTURING
+          - SCORING
+          title: Stage
+          description: The stage whose messages this service's relay delivers
+          examples:
+          - OCR
+        pending:
+          type: integer
+          title: Pending
+          description: Messages not yet delivered, including the ones a relay is sending right now
+          examples:
+          - 0
+        retrying:
+          type: integer
+          title: Retrying
+          description: 'Of `pending`: messages that already failed at least once'
+          examples:
+          - 0
+        oldest_pending_seconds:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Oldest Pending Seconds
+          description: Age of the oldest pending message; null when nothing is pending. Growing past `PIPELINE_OUTBOX_STALE_AFTER_SECONDS`
+            means the orchestrator or the next stage is not taking messages
+          examples:
+          - null
+        dead_letters:
+          type: integer
+          title: Dead Letters
+          description: Messages given up on (a 4xx from the receiver, or 5xx for longer than `PIPELINE_OUTBOX_MAX_AGE_SECONDS`).
+            They stay in `pipeline_outbox` with `failed_at` and `last_error` for inspection and are never
+            retried; anything above 0 needs a human
+          examples:
+          - 0
+      type: object
+      required:
+      - enabled
+      - stage
+      - pending
+      - retrying
+      - dead_letters
+      title: OutboxStatus
+      description: The `data` of `GET /v1/<stage>/outbox`.
+    OutboxStatusResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 200
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: OK
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Success
+          examples:
+          - Success
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/OutboxStatus'
+      type: object
+      required:
+      - data
+      title: OutboxStatusResponse
+      description: Envelope of `GET /v1/<stage>/outbox`.
+    ReadyResponse:
+      properties:
+        status:
+          type: string
+          enum:
+          - ready
+          - not_ready
+          title: Status
+          description: '`ready` (HTTP 200) when every check is `ok`, else `not_ready` (HTTP 503)'
+          examples:
+          - ready
+        checks:
+          additionalProperties:
+            type: string
+            enum:
+            - ok
+            - failed
+          type: object
+          title: Checks
+          description: One entry per REQUIRED dependency of this service; empty when it has none
+          examples:
+          - database: ok
+      type: object
+      required:
+      - status
+      - checks
+      title: ReadyResponse
+      description: '`GET /ready`.'
+    ScoreRequest:
+      properties:
+        slips:
+          items:
+            $ref: '#/components/schemas/SlipPayload'
+          type: array
+          minItems: 1
+          title: Slips
+          description: 'Slip hasil tahap structuring, apa adanya. `source`, `checks`, `counts`, `llm.compare`,
+            `ocr_text` dan `ocr_confidence` harus ikut: fitur terkuat model justru berasal dari jejak
+            itu — kesepakatan regex vs LLM, jarak nominal ke median field, dan porsi kotak OCR berskor
+            rendah di halaman'
+      type: object
+      required:
+      - slips
+      title: ScoreRequest
+    ScoreResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 200
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: OK
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Success
+          examples:
+          - Success
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/ScoringResult'
+      type: object
+      required:
+      - data
+      title: ScoreResponse
+    ScoringJobRequest:
+      properties:
+        request_id:
+          type: string
+          title: Request Id
+          examples:
+          - OCR_9cb01af2-493d-446d-b191-af120333f6d0
+        document_type:
+          type: string
+          title: Document Type
+          default: slip_gaji
+          examples:
+          - slip_gaji
+        guardrails:
+          anyOf:
+          - $ref: '#/components/schemas/GuardrailsPayload'
+          - type: 'null'
+          description: Laporan guardrail dari tahap OCR; dikembalikan apa adanya di hasil akhir
+        ocr:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Ocr
+          description: Hasil tahap OCR; opsional
+        structuring:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Structuring
+          description: 'Hasil tahap structuring. Boleh dihilangkan bila `PIPELINE_HANDOFF_BY_REFERENCE`
+            menyala: service ini membacanya dari `structuring_results` memakai request_id'
+        pipeline_name_sequence:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Pipeline Name Sequence
+          description: Urutan service permintaan ini; null = pipeline penuh
+          examples:
+          - null
+        column_confidence_threshold:
+          anyOf:
+          - additionalProperties:
+              type: number
+            type: object
+          - type: 'null'
+          title: Column Confidence Threshold
+          description: Ambang per field (0-1) dari permintaan; disimpan bersama job supaya GET menjawab
+            sama
+          examples:
+          - gaji_bersih: 0.9
+      type: object
+      required:
+      - request_id
+      title: ScoringJobRequest
+    ScoringJobStatus:
+      properties:
+        request_id:
+          type: string
+          title: Request Id
+          description: request_id of the pipeline run
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        stage:
+          type: string
+          const: SCORING
+          title: Stage
+          default: SCORING
+          examples:
+          - SCORING
+        status:
+          type: string
+          enum:
+          - PROCESSING
+          - DONE
+          - FAILED
+          title: Status
+          description: '`PROCESSING` -> `DONE` | `FAILED`. A `FAILED` job may go back to `PROCESSING`
+            when resubmitted'
+          examples:
+          - DONE
+        error_message:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error Message
+          description: Why the stage failed; null unless `status` is `FAILED`. Same text as the FAILED
+            callback
+          examples:
+          - null
+        created_at:
+          type: string
+          title: Created At
+          description: When the job was first accepted (ISO 8601, UTC)
+          examples:
+          - '2026-09-18T04:00:00+00:00'
+        updated_at:
+          type: string
+          title: Updated At
+          description: Last status change (ISO 8601, UTC)
+          examples:
+          - '2026-09-18T04:00:01+00:00'
+        pipeline_name_sequence:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Pipeline Name Sequence
+          description: 'The request''s pipeline_name_sequence (null: the full pipeline). The orchestrator
+            reads it from the OCR job to answer `GET /v1/extract-ocr/{request_id}` up to the same last
+            service as the POST'
+          examples:
+          - null
+        column_confidence_threshold:
+          anyOf:
+          - additionalProperties:
+              type: number
+            type: object
+          - type: 'null'
+          title: Column Confidence Threshold
+          description: The request's per-field thresholds (0-1); null when not sent
+          examples:
+          - null
+        result:
+          anyOf:
+          - $ref: '#/components/schemas/ScoringResult'
+          - type: 'null'
+          description: Skor keyakinan setelah `status` menjadi `DONE`
+      type: object
+      required:
+      - request_id
+      - status
+      - created_at
+      - updated_at
+      title: ScoringJobStatus
+    ScoringJobStatusResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 200
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: OK
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Success
+          examples:
+          - Success
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/ScoringJobStatus'
+      type: object
+      required:
+      - data
+      title: ScoringJobStatusResponse
+    ScoringResult:
+      properties:
+        slips:
+          items:
+            $ref: '#/components/schemas/SlipScores'
+          type: array
+          title: Slips
+          description: Satu entri per slip
+        threshold:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Threshold
+          description: 'Ambang bawaan (0-1) yang memisahkan `confidence: 1` dari `0` di kontrak `extract-ocr`
+            (`FIELD_CONFIDENCE_THRESHOLD`); `column_confidence_threshold` permintaan menimpanya per field.
+            Skor mentah tetap dikembalikan, supaya ambangnya bisa diubah tanpa melatih ulang apa pun'
+          examples:
+          - 0.5
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+          description: Backend model yang memberi skor
+          examples:
+          - conf_v2
+        column_confidence_threshold:
+          anyOf:
+          - additionalProperties:
+              type: number
+            type: object
+          - type: 'null'
+          title: Column Confidence Threshold
+          description: Ambang per field dari permintaan (`column_confidence_threshold`); null bila tidak
+            dikirim
+          examples:
+          - all_field: 0.6
+            gaji_bersih: 0.9
+      type: object
+      required:
+      - slips
+      - threshold
+      title: ScoringResult
+    ScoringStageCallback:
+      properties:
+        request_id:
+          type: string
+          title: Request Id
+          description: request_id yang Anda kirim lewat `POST /v1/ekstraksi/jobs`
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        stage:
+          type: string
+          const: SCORING
+          title: Stage
+          description: 'Selalu `SCORING`: tahap terakhir'
+          default: SCORING
+          examples:
+          - SCORING
+        status:
+          type: string
+          enum:
+          - DONE
+          - FAILED
+          title: Status
+          description: Hasil tahap ini. `FAILED` di tahap mana pun mengakhiri permintaan
+          examples:
+          - DONE
+        result:
+          anyOf:
+          - $ref: '#/components/schemas/FinalResult'
+          - type: 'null'
+          description: Hasil akhir permintaan ketika `status` `DONE`; null ketika `FAILED`
+        error_message:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error Message
+          description: Kenapa gagal; null bila `status` `DONE`
+          examples:
+          - null
+        error_code:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error Code
+          description: 'Hanya saat penolakan: `DOWNSTREAM_VALIDATION_ERROR` ketika dokumen ditahan guardrail
+            (`error_message` memuat alasannya). Tidak ada ketika sebuah tahap rusak'
+          examples:
+          - null
+      type: object
+      required:
+      - request_id
+      - status
+      title: ScoringStageCallback
+      description: Isi callback yang dikirim sebuah tahap ke orchestrator saat selesai.
+    SlipPayload:
+      properties:
+        slip_no:
+          type: integer
+          minimum: 1.0
+          title: Slip No
+          description: Nomor urut slip dalam dokumen
+          examples:
+          - 1
+        page:
+          anyOf:
+          - type: integer
+            minimum: 1.0
+          - type: 'null'
+          title: Page
+          description: Halaman asal slip ini
+          examples:
+          - 1
+        fields:
+          additionalProperties: true
+          type: object
+          title: Fields
+          description: 20 field, selalu lengkap; null bila tidak ditemukan. Nominal uang sudah integer
+        source:
+          additionalProperties: true
+          type: object
+          title: Source
+          description: 'Asal tiap nilai (`how`: regex | llm | derived, sinonim label, baris OCR) — fitur
+            model keyakinan'
+        checks:
+          additionalProperties: true
+          type: object
+          title: Checks
+          description: Hasil cek aritmetika slip
+        counts:
+          additionalProperties: true
+          type: object
+          title: Counts
+          description: Berapa field terisi, dan dari lapisan mana
+        llm:
+          additionalProperties: true
+          type: object
+          title: Llm
+          description: Jejak arbitrase LLM; `compare` dibaca model keyakinan
+        ocr_text:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ocr Text
+          description: Teks halaman asal — fitur mutu OCR di tahap scoring
+        ocr_confidence:
+          additionalProperties: true
+          type: object
+          title: Ocr Confidence
+          description: Skor OCR halaman asal
+        missing_mandatory_fields:
+          items:
+            type: string
+          type: array
+          title: Missing Mandatory Fields
+          description: Field wajib yang tidak terisi pada slip ini
+      additionalProperties: true
+      type: object
+      required:
+      - slip_no
+      - fields
+      title: SlipPayload
+      description: Satu slip gaji hasil structuring.
+    SlipScores:
+      properties:
+        slip_no:
+          type: integer
+          minimum: 1.0
+          title: Slip No
+          examples:
+          - 1
+        scores:
+          additionalProperties:
+            type: number
+          type: object
+          title: Scores
+          description: '{field: P(nilai ini benar), 0-1}. Hanya field yang ada nilainya yang diberi skor'
+          examples:
+          - gaji_pokok: 0.936
+            total_pendapatan: 0.9247
+            tunjangan_makan: 0.8889
+      type: object
+      required:
+      - slip_no
+      - scores
+      title: SlipScores
+  securitySchemes:
+    APIKeyHeader:
+      type: apiKey
+      description: API key for this service
+      in: header
+      name: X-API-Key
+tags:
+- name: Pipeline
+  description: 'Tahap pipeline asinkron: 202, kerja di latar, callback'
+- name: Callbacks
+  description: Permintaan yang DIKIRIM service ini ke orchestrator (lihat Webhooks)
+- name: Scoring
+  description: Skor keyakinan per field, sinkron
+- name: Health
+  description: Health and readiness checks; no API key

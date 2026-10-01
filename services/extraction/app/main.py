@@ -1,0 +1,116 @@
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from ocr_common.pipeline.database import check_connection, dispose_engines
+from ocr_common.pipeline.schemas import StageCallback
+from ocr_common.web.app import add_stage_callback_webhook, create_app, database_readiness
+
+from app.api import extraction, jobs, testing
+from app.config import get_settings
+from app.dependencies import (
+    get_guardrails_client,
+    get_next_stage,
+    get_ocr_engine,
+    get_pipeline,
+    get_reaper,
+    get_relay,
+    get_testing_next_stage,
+    get_testing_pipeline,
+    get_testing_reaper,
+    get_testing_relay,
+)
+
+settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if settings.database_url:
+        await check_connection(settings.database_url)
+    ocr_engine = get_ocr_engine()
+    pipeline = get_pipeline()
+    next_stage = get_next_stage()
+    relay = get_relay()
+    if relay is not None:
+        relay.start()
+    reaper = get_reaper()
+    if reaper is not None:
+        reaper.start()
+    testing_relay = testing_reaper = None
+    if settings.testing_endpoints:
+        testing_relay, testing_reaper = get_testing_relay(), get_testing_reaper()
+        if testing_relay is not None:
+            testing_relay.start()
+        if testing_reaper is not None:
+            testing_reaper.start()
+    yield
+    if reaper is not None:
+        await reaper.stop()
+    await pipeline.aclose(settings.pipeline_drain_timeout_seconds, relay=relay)
+    await next_stage.aclose()
+    if get_guardrails_client.cache_info().currsize:
+        await get_guardrails_client().aclose()
+    if settings.testing_endpoints:
+        if testing_reaper is not None:
+            await testing_reaper.stop()
+        await get_testing_pipeline().aclose(settings.pipeline_drain_timeout_seconds, relay=testing_relay)
+        await get_testing_next_stage().aclose()
+    close = getattr(ocr_engine, "aclose", None)  # only the HTTP-backed models hold a connection
+    if close is not None:
+        await close()
+    await dispose_engines()
+
+
+app = create_app(
+    settings=settings,
+    title="OCR Slip Gaji Extraction API",
+    service_name="extraction",
+    description=(
+        "OCR stage of the slip gaji pipeline (ms-bribrain-nilam-ocr-slipgaji-extraction). "
+        "**Async pipeline:** the slip gaji orchestrator POSTs /v1/extraction/jobs and gets 202; this service reads "
+        "the document in the background, then (when the sequence includes `guardrails`) calls guardrail-blank, "
+        "guardrail-blur and guardrail-identity at the same time, stores the result, reports to the central "
+        "orchestrator (callback / its tables), and hands the job to the structuring service. "
+        "The raw OCR step is also exposed as /v1/extraction/extract. "
+        "All endpoints except /health require an X-API-Key header."
+    ),
+    tags=[
+        {"name": "Pipeline", "description": "Asynchronous pipeline stage: 202, background work, callback, hand-off"},
+        {"name": "Callbacks", "description": "Requests this service SENDS to the orchestrator (see Webhooks)"},
+        {"name": "Extraction", "description": "Raw OCR text, synchronous"},
+    ],
+    routers=[jobs.router, extraction.router, *([testing.router] if settings.testing_endpoints else [])],
+    backends={
+        "extraction": settings.extraction_backend,
+        "guardrails": ",".join(
+            name
+            for name, on in (
+                ("blank", settings.guardrail_blank_enabled),
+                ("blur", settings.guardrail_blur_enabled),
+                ("identity", settings.guardrail_identity_enabled),
+            )
+            if on
+        )
+        or "off",
+        "storage": "postgres" if settings.database_url else "memory",
+    },
+    readiness=database_readiness(settings.database_url),
+    health=database_readiness(settings.database_url),
+    backends_example={"extraction": "paddle", "storage": "postgres"},
+    readiness_example={"database": "ok"},
+    lifespan=lifespan,
+)
+
+add_stage_callback_webhook(
+    app,
+    body_model=StageCallback,
+    sent=(
+        "Once per job of `POST /v1/extraction/jobs`: `stage: OCR` with `status: DONE` once the OCR result is "
+        "stored, or `status: FAILED` with `error_message` when the document could not be read (the chain stops "
+        "there). Additionally `stage: STRUCTURING`, `status: FAILED` when OCR succeeded but the structuring "
+        "service could not be reached after retries. Without `PIPELINE_OUTBOX` the `OCR` callback is sent before "
+        "the hand-off to structuring; with it the hand-off goes first, so the `STRUCTURING` callback may arrive "
+        "before this one."
+    ),
+)

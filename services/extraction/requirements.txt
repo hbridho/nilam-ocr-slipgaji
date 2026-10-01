@@ -1,0 +1,18 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic-settings==2.5.2
+httpx==0.27.2
+sqlalchemy==2.0.52
+greenlet==3.2.4
+asyncpg==0.31.0
+# slip_ml: render halaman + panggil layanan OCR. Tidak ada model OCR di image ini — backend
+# bawaannya `api`, dan modelnya dikelola di layanan OCR (paddle6 / PP-OCRv6).
+# Disamakan dengan service lain. Pin yang tertinggal (PyMuPDF 1.24.14, Pillow 11.0.0, numpy 2.1.3)
+# tidak pernah bentrok di produksi — tiap image memakai requirements.lock-nya sendiri — tetapi
+# lingkungan dev memasang kelima service sekaligus, dan di sana bentroknya tidak bisa diselesaikan.
+requests==2.32.3
+PyMuPDF==1.28.2
+Pillow==12.3.0
+numpy==2.3.5
+PyYAML==6.0.2

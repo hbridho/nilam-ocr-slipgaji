@@ -1,0 +1,1460 @@
+openapi: 3.1.0
+info:
+  title: OCR Slip Gaji Orchestrator API
+  description: 'Pintu masuk pipeline OCR Slip Gaji (`ms-bribrain-nilam-ocr-slipgaji-orchestrator`), dan
+    satu-satunya service yang dipanggil Orkestrasi pusat. Kontraknya mengikuti API spec NILAM [07].
+
+
+    `POST /v1/extract-ocr` memeriksa berkasnya, menyerahkannya ke tahap OCR, dan menunggu sampai service
+    terakhir `pipeline_name_sequence` selama `PIPELINE_WAIT_SECONDS`: 200 dengan hasilnya, atau 202 selama
+    masih berjalan. `GET /v1/extract-ocr/{request_id}` menjawab kontrak yang sama kapan pun sesudahnya.
+
+
+    **Satu dokumen bisa berisi beberapa slip**: `data` memuat `total_slip` dan array `slip`, satu entri
+    per halaman.
+
+
+    **Guardrail dijalankan tahap OCR, bukan di sini**: ketiga service guardrail (blank, blur, identity)
+    membaca teks OCR, jadi penilaiannya baru mungkin setelah dokumen dibaca. Penolakannya sampai ke klien
+    sebagai 400 dengan `guardrails: 1` dan `pipeline_last_stage: guardrails`.
+
+
+    Service ini tidak menyimpan apa pun: job disimpan tiap tahap, dan tahap itu pula yang mengirim callback
+    hasil. Semua endpoint kecuali /health, /ready dan /metrics memerlukan header X-API-Key.
+
+
+    ## Conventions (the same for every nilam-ocr service)
+
+
+    **Authentication.** Every endpoint except `/health`, `/ready` and `/metrics` requires the header `X-API-Key`.
+
+    A missing or wrong key answers `401`. The services are reachable only from inside the cluster.
+
+
+    **Envelope.** Every JSON response, success or error, has the same shape:
+
+    `{status_code, status_desc, message, data, errors, request_id}`. `status_code` always equals the HTTP
+
+    status. On success `errors` is null; on error `data` is null.
+
+
+    **Errors.** `errors` is a stable, machine-readable code; branch on it, not on the wording of `message`.
+
+    The document checks: `EMPTY_FILE`, `UNSUPPORTED_FILE_TYPE`, `UNREADABLE_FILE`, `TOO_MANY_PAGES`,
+
+    `INVALID_FILE_SOURCE`, `FILE_URL_REJECTED` (400), `FILE_TOO_LARGE` (413). Otherwise the code of the
+    status:
+
+    `UNAUTHORIZED` (401), `REQUEST_ID_NOT_FOUND` (404, an unknown request_id), `NOT_FOUND` (404, a path
+    that does
+
+    not exist), `METHOD_NOT_ALLOWED` (405), `VALIDATION_ERROR` (422), `INTERNAL_SERVER_ERROR` (500),
+
+    `DOWNSTREAM_UNAVAILABLE` (503), `DOWNSTREAM_TIMEOUT` (504), unless an endpoint documents a more precise
+    one.
+
+    `400` = the request or the document is unusable (do not retry unchanged). `503` / `504` are safe to
+    retry.
+
+
+    **request_id.** Minted by the central orchestrator and carried through every stage. Where an endpoint
+    has
+
+    no request_id of its own, the `X-Request-ID` request header is used (and echoed in the response header);
+
+    without it the service generates one.
+
+
+    **Asynchronous stages** (internal: only the orchestrator SLIP_GAJI and the previous stage call them).
+    `POST
+
+    .../jobs` answers `202` immediately and does the work in the background. The outcome is reported by
+    a
+
+    callback to the central orchestrator (see *Webhooks*), and can be read at any time with
+
+    `GET .../jobs/{request_id}`, which the orchestrator SLIP_GAJI''s `GET /v1/extract-ocr/{request_id}`
+    combines
+
+    over the three stages. Submitting the same request_id again is idempotent:
+
+    `202` with `duplicate: true`, the work is not repeated, unless the earlier attempt `FAILED` or has
+    been
+
+    `PROCESSING` for longer than the job lease (`PIPELINE_JOB_LEASE_SECONDS`, 5 minutes by default: the
+
+    process running it died). A job still running when the service shuts down is reported `FAILED`. Because
+
+    the request was already answered `202`, a problem with the document itself (unreadable file, no text,
+
+    unsupported document type) shows up as a `FAILED` job and callback, not as a `4xx`.
+
+    '
+  version: 1.0.0
+servers:
+- url: /
+  description: This host (where this page is served)
+- url: http://ms-bribrain-nilam-ocr-slipgaji.{namespace}.svc.cluster.local:8034
+  description: 'GKE, from another namespace: the entry Service (the central orchestrator / gateway)'
+  variables:
+    namespace:
+      default: ms-bribrain-nilam-ocr-slipgaji
+      description: 'Namespace of the Helm release (deploy/helm/deploy.sh: nilam-ocr-slipgaji)'
+- url: http://ms-bribrain-nilam-ocr-slipgaji-orchestrator.{namespace}.svc.cluster.local:8034
+  description: GKE, from inside the release's namespace (the other services of this pipeline)
+  variables:
+    namespace:
+      default: ms-bribrain-nilam-ocr-slipgaji
+      description: 'Namespace of the Helm release (deploy/helm/deploy.sh: nilam-ocr-slipgaji)'
+- url: http://orchestrator:8034
+  description: The Docker Compose network
+- url: http://127.0.0.1:8034
+  description: Local development
+paths:
+  /health:
+    get:
+      tags:
+      - Health
+      summary: Health check, including the database
+      description: 'Says whether the service can reach what it depends on: 200 `healthy` when every dependency
+        it checks answers (the database, for a service that has one), 503 `unhealthy` with the cause in
+        `detail` otherwise. Each check gives up after 3 s. Also lists the active implementations (`backends`).
+        Not used by the Kubernetes probes: liveness and startup check the port, readiness is `/ready`.
+        Does not require an API key.'
+      operationId: getHealth
+      responses:
+        '200':
+          description: Every dependency answers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                healthy:
+                  summary: Healthy
+                  value:
+                    status: healthy
+                    version: 1.0.0
+                    device: cpu
+                    backends: {}
+        '503':
+          description: A dependency does not answer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: unhealthy
+                version: 1.0.0
+                detail: database unreachable
+                device: cpu
+                backends: {}
+  /ready:
+    get:
+      tags:
+      - Health
+      summary: Readiness probe
+      description: 'The readiness probe. Liveness is checked on the port, never on a dependency (a database
+        blip must not make Kubernetes restart every pod). /ready says whether this pod can do its job
+        right now: 200 when every REQUIRED dependency of this service answers, 503 otherwise, so the pod
+        is taken out of the Service until it recovers. Downstream stages and model services are deliberately
+        not checked: their outage is reported per job, not by refusing traffic. Does not require an API
+        key.'
+      operationId: getReadiness
+      responses:
+        '200':
+          description: Every required dependency answers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              examples:
+                ready:
+                  summary: Ready
+                  value:
+                    status: ready
+                    checks: {}
+        '503':
+          description: A required dependency is unavailable; the pod is taken out of the Service
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              example:
+                status: not_ready
+                checks: {}
+  /metrics:
+    get:
+      tags:
+      - Health
+      summary: Prometheus metrics
+      description: 'Prometheus text exposition of this process: `http_requests_total` and `http_request_duration_seconds`
+        per route template, and for the pipeline stages `pipeline_jobs_total` (by outcome), `pipeline_job_duration_seconds`,
+        `pipeline_stale_jobs_reclaimed_total`, `pipeline_outbox_deliveries_total` and the outbox backlog
+        gauges (`pipeline_outbox_pending`, `_retrying`, `_dead_letters`, `_oldest_pending_seconds`). Scraped
+        inside the cluster; does not require an API key.'
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Metrics in the Prometheus text format
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/extract-ocr:
+    post:
+      tags:
+      - Extract OCR
+      summary: Jalankan pipeline atas sebuah dokumen slip gaji, jawab hasilnya atau 202
+      description: '**Satu-satunya panggilan Orkestrasi pusat.** Memeriksa berkas (tipe, `MAX_UPLOAD_BYTES`
+        2,5 MB, `MAX_DOCUMENT_PAGES`), menyerahkannya ke tahap OCR, lalu menunggu sampai service terakhir
+        `pipeline_name_sequence` selama `PIPELINE_WAIT_SECONDS` (bawaan 15 detik). Bila belum selesai:
+        202 dan hasil dikirim lewat callback, atau dibaca dengan `GET /v1/extract-ocr/{request_id}`.
+
+
+        | Hasil | HTTP | `data` | `guardrails` | `errors` | `pipeline_last_stage` |
+
+        |---|---|---|---|---|---|
+
+        | Selesai | 200 | hasil service terakhir | `0` | null | service terakhir |
+
+        | Masih berjalan | 202 | null | null | null | service yang sedang berjalan |
+
+        | Ditahan guardrail | 400 | null | `1` | `DOWNSTREAM_VALIDATION_ERROR` | `guardrails` |
+
+        | Ditolak aturan structuring | 400 | null | `1` | `DOWNSTREAM_VALIDATION_ERROR` | `structuring`
+        |
+
+        | Sebuah tahap gagal | 422 | null | `0` | `OCR_FAILED` / `STRUCTURING_FAILED` / `SCORING_FAILED`
+        | tahap itu |
+
+
+        **`pipeline_name_sequence` (saklar service).** Urutan baku `guardrails -> extraction -> structuring
+        -> scoring`; `guardrails` boleh dilewati dari depan, ekor boleh dipotong, tengah tidak boleh dilewati;
+        pelanggaran 422 `INVALID_PIPELINE_SEQUENCE`. Service terakhir mengakhiri permintaan dan hasilnya
+        menjadi `data` apa adanya.
+
+
+        **Guardrail slip gaji membaca teks OCR** (AUC 0,911, piksel hanya 0,638), jadi `guardrails` dijalankan
+        tahap OCR setelah dokumen dibaca: ketiga service guardrail-blank, guardrail-blur, guardrail-identity
+        dipanggil bersamaan, masing-masing bisa dimatikan sendiri. Akibatnya `["guardrails"]` pun menjalankan
+        OCR, dan bisa dijawab 202 bila melewati masa tunggu.
+
+
+        **Satu dokumen bisa berisi beberapa slip** (tiga bulan dalam satu berkas adalah bentuk yang paling
+        sering diunggah), jadi `data` pipeline penuh berisi `total_slip` dan array `slip`, satu entri
+        per halaman.
+
+
+        **Confidence.** Setiap field `{value, confidence}`; `confidence` 1 ketika probabilitas model keyakinan
+        (0-1) >= ambang field itu (`column_confidence_threshold`, lalu `all_field`, lalu `FIELD_CONFIDENCE_THRESHOLD`
+        0,5), selain itu 0. Callback membawa probabilitas 0-1 mentahnya.
+
+
+        **Idempotensi.** request_id yang sama tidak menjalankan pipeline dua kali kecuali percobaan OCR
+        sebelumnya `FAILED` atau melewati sewa job (`PIPELINE_JOB_LEASE_SECONDS`).'
+      operationId: extractOcr
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_extractOcr'
+        required: true
+      responses:
+        '200':
+          description: Selesai di dalam masa tunggu
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtractOcrResponse'
+              examples:
+                completed:
+                  summary: 'Pipeline penuh: satu berkas tiga bulan'
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: OCR extraction completed successfully
+                    data:
+                      total_slip: 3
+                      slip:
+                      - page: 1
+                        nama_perusahaan:
+                          value: PT SUMBER REJEKI MAKMUR
+                          confidence: 1
+                        periode:
+                          value: 2025-02
+                          confidence: 1
+                        nama_karyawan:
+                          value: ANDI SAPUTRA
+                          confidence: 1
+                        nomor_induk_karyawan:
+                          value: '202309001'
+                          confidence: 1
+                        jabatan:
+                          value: Staff Gudang
+                          confidence: 1
+                        divisi:
+                          value: Produksi
+                          confidence: 0
+                        status_pegawai:
+                          value: Tetap
+                          confidence: 1
+                        gaji_pokok:
+                          value: 4500000
+                          confidence: 1
+                        tunjangan_jabatan:
+                          value: 500000
+                          confidence: 1
+                        tunjangan_transport:
+                          value: 300000
+                          confidence: 1
+                        tunjangan_makan:
+                          value: 600000
+                          confidence: 1
+                        tunjangan_komunikasi:
+                          value: 150000
+                          confidence: 0
+                        tunjangan_lain:
+                          value: 200000
+                          confidence: 0
+                        bonus:
+                          confidence: 0
+                        insentif:
+                          value: 250000
+                          confidence: 1
+                        lembur:
+                          value: 180000
+                          confidence: 1
+                        thr:
+                          confidence: 0
+                        total_pendapatan:
+                          value: 6680000
+                          confidence: 1
+                        total_potongan:
+                          value: 225000
+                          confidence: 1
+                        gaji_bersih:
+                          value: 6455000
+                          confidence: 1
+                        missing_mandatory_fields: []
+                      - page: 2
+                        nama_perusahaan:
+                          value: PT SUMBER REJEKI MAKMUR
+                          confidence: 1
+                        periode:
+                          value: 2025-03
+                          confidence: 1
+                        nama_karyawan:
+                          value: ANDI SAPUTRA
+                          confidence: 1
+                        nomor_induk_karyawan:
+                          value: '202309001'
+                          confidence: 1
+                        jabatan:
+                          value: Staff Gudang
+                          confidence: 1
+                        divisi:
+                          value: Produksi
+                          confidence: 0
+                        status_pegawai:
+                          value: Tetap
+                          confidence: 1
+                        gaji_pokok:
+                          value: 4500000
+                          confidence: 1
+                        tunjangan_jabatan:
+                          value: 500000
+                          confidence: 1
+                        tunjangan_transport:
+                          value: 300000
+                          confidence: 1
+                        tunjangan_makan:
+                          value: 600000
+                          confidence: 1
+                        tunjangan_komunikasi:
+                          value: 150000
+                          confidence: 0
+                        tunjangan_lain:
+                          value: 200000
+                          confidence: 0
+                        bonus:
+                          confidence: 0
+                        insentif:
+                          value: 250000
+                          confidence: 1
+                        lembur:
+                          value: 180000
+                          confidence: 1
+                        thr:
+                          confidence: 0
+                        total_pendapatan:
+                          value: 6680000
+                          confidence: 1
+                        total_potongan:
+                          value: 225000
+                          confidence: 1
+                        gaji_bersih:
+                          value: 6455000
+                          confidence: 1
+                        missing_mandatory_fields: []
+                      - page: 3
+                        nama_perusahaan:
+                          value: PT SUMBER REJEKI MAKMUR
+                          confidence: 1
+                        periode:
+                          value: 2025-04
+                          confidence: 1
+                        nama_karyawan:
+                          value: ANDI SAPUTRA
+                          confidence: 1
+                        nomor_induk_karyawan:
+                          value: '202309001'
+                          confidence: 1
+                        jabatan:
+                          value: Staff Gudang
+                          confidence: 1
+                        divisi:
+                          value: Produksi
+                          confidence: 0
+                        status_pegawai:
+                          value: Tetap
+                          confidence: 1
+                        gaji_pokok:
+                          value: 4500000
+                          confidence: 1
+                        tunjangan_jabatan:
+                          value: 500000
+                          confidence: 1
+                        tunjangan_transport:
+                          value: 300000
+                          confidence: 1
+                        tunjangan_makan:
+                          value: 600000
+                          confidence: 1
+                        tunjangan_komunikasi:
+                          value: 150000
+                          confidence: 0
+                        tunjangan_lain:
+                          value: 200000
+                          confidence: 0
+                        bonus:
+                          confidence: 0
+                        insentif:
+                          value: 250000
+                          confidence: 1
+                        lembur:
+                          value: 180000
+                          confidence: 1
+                        thr:
+                          confidence: 0
+                        total_pendapatan:
+                          value: 6680000
+                          confidence: 1
+                        total_potongan:
+                          value: 225000
+                          confidence: 1
+                        gaji_bersih:
+                          value: 6455000
+                          confidence: 1
+                        missing_mandatory_fields: []
+                    request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                    guardrails: 0
+                    pipeline_last_stage: scoring
+                guardrails_only:
+                  summary: '`["guardrails"]`: laporan guardrail'
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: OCR extraction completed successfully
+                    data:
+                      passed: true
+                      document:
+                        verdict: accepted
+                        confidence: 0.9934
+                        n_pages: 1
+                        threshold: 0.47
+                        threshold_target: accept
+                      pages: []
+                      checks:
+                        blank:
+                          passed: true
+                        blur:
+                          passed: true
+                          p_broken: 0.0153
+                        identity:
+                          passed: true
+                          proba_slip_gaji: 0.9934
+                      skipped: []
+                      unavailable: []
+                    request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                    guardrails: 0
+                    pipeline_last_stage: guardrails
+        '202':
+          description: Masih berjalan saat masa tunggu habis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtractOcrResponse'
+              examples:
+                processing:
+                  summary: Masih diproses
+                  value:
+                    status_code: 202
+                    status_desc: Accepted
+                    message: OCR job accepted; still processing
+                    request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                    pipeline_last_stage: structuring
+        '400':
+          description: 'Ditahan guardrail atau ditolak aturan structuring (`DOWNSTREAM_VALIDATION_ERROR`,
+            `guardrails: 1`), `UNSUPPORTED_DOCUMENT_TYPE`, `EMPTY_FILE`, `UNSUPPORTED_FILE_TYPE`, `UNREADABLE_FILE`,
+            `TOO_MANY_PAGES` (`Jumlah halaman melebihi batas, pastikan hanya mengunggah dokumen slip gaji`),
+            `INVALID_FILE_SOURCE`, `FILE_URL_REJECTED`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtractOcrResponse'
+              example:
+                status_code: 400
+                status_desc: Bad Request
+                message: Dokumen ini bukan slip gaji. Mohon unggah slip gaji.
+                errors: DOWNSTREAM_VALIDATION_ERROR
+                request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                guardrails: 1
+                pipeline_last_stage: guardrails
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: orchestrator
+        '413':
+          description: Dokumen melebihi `MAX_UPLOAD_BYTES` (2,5 MB); tidak ada yang dijalankan
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 413
+                status_desc: Payload Too Large
+                message: Ukuran dokumen melebihi batas 2,5 MB, pastikan hanya mengunggah dokumen slip
+                  gaji
+                errors: FILE_TOO_LARGE
+                pipeline_last_stage: orchestrator
+        '422':
+          description: '`INVALID_PIPELINE_SEQUENCE`, `INVALID_THRESHOLD`, `INVALID_PARAMS`, `VALIDATION_ERROR`
+            (tidak ada yang dijalankan), atau sebuah tahap gagal: `OCR_FAILED`, `STRUCTURING_FAILED`,
+            `SCORING_FAILED`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtractOcrResponse'
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'Invalid pipeline_name_sequence: services must keep the order guardrails -> extraction
+                  -> structuring -> scoring without skipping one in the middle'
+                errors: INVALID_PIPELINE_SEQUENCE
+                request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                pipeline_last_stage: orchestrator
+        '500':
+          description: Service extraction menjawab bentuk tak terduga
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 500
+                status_desc: Internal Server Error
+                message: extraction service returned an unexpected response
+                errors: extraction service returned an unexpected response
+                pipeline_last_stage: orchestrator
+        '503':
+          description: Service extraction tidak terjangkau; tidak ada yang dijalankan
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 503
+                status_desc: Service Unavailable
+                message: extraction service is unavailable
+                errors: extraction service is unavailable
+                pipeline_last_stage: orchestrator
+        '504':
+          description: Service extraction tidak menjawab tepat waktu
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 504
+                status_desc: Gateway Timeout
+                message: extraction service timed out after 10.0s
+                errors: extraction service timed out after 10.0s
+                pipeline_last_stage: orchestrator
+      security:
+      - APIKeyHeader: []
+  /v1/extract-ocr/{request_id}:
+    get:
+      tags:
+      - Extract OCR
+      summary: 'Di mana sebuah permintaan sekarang: jawaban extract-ocr, tanpa menunggu'
+      description: 'Membaca job tiap tahap milik `request_id` sekali, sampai service terakhir `pipeline_name_sequence`
+        permintaan itu (tersimpan bersama job OCR), dan menjawab dengan kontrak yang sama seperti `POST
+        /v1/extract-ocr` — termasuk confidence menurut `column_confidence_threshold` yang dikirim saat
+        POST:
+
+
+        | Hasil | HTTP | `data` | `guardrails` | `errors` | `pipeline_last_stage` |
+
+        |---|---|---|---|---|---|
+
+        | Selesai | 200 | hasil service terakhir | `0` | null | service terakhir |
+
+        | Masih berjalan | 202 | null | null | null | service yang sedang berjalan |
+
+        | Ditahan guardrail | 400 | null | `1` | `DOWNSTREAM_VALIDATION_ERROR` | `guardrails` |
+
+        | Ditolak aturan structuring | 400 | null | `1` | `DOWNSTREAM_VALIDATION_ERROR` | `structuring`
+        |
+
+        | Sebuah tahap gagal | 422 | null | `0` | `OCR_FAILED` / `STRUCTURING_FAILED` / `SCORING_FAILED`
+        | tahap itu |
+
+
+        `params` selalu null di sini (tidak disimpan). **404** `REQUEST_ID_NOT_FOUND`: tidak ada job untuk
+        request_id ini.
+
+
+        **Batasan.** Penyerahan antar dua tahap yang gagal permanen membuat tahap berikutnya tidak punya
+        job, sehingga endpoint ini terus menjawab `202`. Callback `FAILED` dan tabel Orkestrasi pusat
+        yang menyimpan keadaan akhir itu.'
+      operationId: getExtractOcr
+      security:
+      - APIKeyHeader: []
+      parameters:
+      - name: request_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Request Id
+      responses:
+        '200':
+          description: Selesai
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtractOcrResponse'
+              examples:
+                completed:
+                  summary: Hasil OCR
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: OCR extraction completed successfully
+                    data:
+                      total_slip: 3
+                      slip:
+                      - page: 1
+                        nama_perusahaan:
+                          value: PT SUMBER REJEKI MAKMUR
+                          confidence: 1
+                        periode:
+                          value: 2025-02
+                          confidence: 1
+                        nama_karyawan:
+                          value: ANDI SAPUTRA
+                          confidence: 1
+                        nomor_induk_karyawan:
+                          value: '202309001'
+                          confidence: 1
+                        jabatan:
+                          value: Staff Gudang
+                          confidence: 1
+                        divisi:
+                          value: Produksi
+                          confidence: 0
+                        status_pegawai:
+                          value: Tetap
+                          confidence: 1
+                        gaji_pokok:
+                          value: 4500000
+                          confidence: 1
+                        tunjangan_jabatan:
+                          value: 500000
+                          confidence: 1
+                        tunjangan_transport:
+                          value: 300000
+                          confidence: 1
+                        tunjangan_makan:
+                          value: 600000
+                          confidence: 1
+                        tunjangan_komunikasi:
+                          value: 150000
+                          confidence: 0
+                        tunjangan_lain:
+                          value: 200000
+                          confidence: 0
+                        bonus:
+                          confidence: 0
+                        insentif:
+                          value: 250000
+                          confidence: 1
+                        lembur:
+                          value: 180000
+                          confidence: 1
+                        thr:
+                          confidence: 0
+                        total_pendapatan:
+                          value: 6680000
+                          confidence: 1
+                        total_potongan:
+                          value: 225000
+                          confidence: 1
+                        gaji_bersih:
+                          value: 6455000
+                          confidence: 1
+                        missing_mandatory_fields: []
+                      - page: 2
+                        nama_perusahaan:
+                          value: PT SUMBER REJEKI MAKMUR
+                          confidence: 1
+                        periode:
+                          value: 2025-03
+                          confidence: 1
+                        nama_karyawan:
+                          value: ANDI SAPUTRA
+                          confidence: 1
+                        nomor_induk_karyawan:
+                          value: '202309001'
+                          confidence: 1
+                        jabatan:
+                          value: Staff Gudang
+                          confidence: 1
+                        divisi:
+                          value: Produksi
+                          confidence: 0
+                        status_pegawai:
+                          value: Tetap
+                          confidence: 1
+                        gaji_pokok:
+                          value: 4500000
+                          confidence: 1
+                        tunjangan_jabatan:
+                          value: 500000
+                          confidence: 1
+                        tunjangan_transport:
+                          value: 300000
+                          confidence: 1
+                        tunjangan_makan:
+                          value: 600000
+                          confidence: 1
+                        tunjangan_komunikasi:
+                          value: 150000
+                          confidence: 0
+                        tunjangan_lain:
+                          value: 200000
+                          confidence: 0
+                        bonus:
+                          confidence: 0
+                        insentif:
+                          value: 250000
+                          confidence: 1
+                        lembur:
+                          value: 180000
+                          confidence: 1
+                        thr:
+                          confidence: 0
+                        total_pendapatan:
+                          value: 6680000
+                          confidence: 1
+                        total_potongan:
+                          value: 225000
+                          confidence: 1
+                        gaji_bersih:
+                          value: 6455000
+                          confidence: 1
+                        missing_mandatory_fields: []
+                      - page: 3
+                        nama_perusahaan:
+                          value: PT SUMBER REJEKI MAKMUR
+                          confidence: 1
+                        periode:
+                          value: 2025-04
+                          confidence: 1
+                        nama_karyawan:
+                          value: ANDI SAPUTRA
+                          confidence: 1
+                        nomor_induk_karyawan:
+                          value: '202309001'
+                          confidence: 1
+                        jabatan:
+                          value: Staff Gudang
+                          confidence: 1
+                        divisi:
+                          value: Produksi
+                          confidence: 0
+                        status_pegawai:
+                          value: Tetap
+                          confidence: 1
+                        gaji_pokok:
+                          value: 4500000
+                          confidence: 1
+                        tunjangan_jabatan:
+                          value: 500000
+                          confidence: 1
+                        tunjangan_transport:
+                          value: 300000
+                          confidence: 1
+                        tunjangan_makan:
+                          value: 600000
+                          confidence: 1
+                        tunjangan_komunikasi:
+                          value: 150000
+                          confidence: 0
+                        tunjangan_lain:
+                          value: 200000
+                          confidence: 0
+                        bonus:
+                          confidence: 0
+                        insentif:
+                          value: 250000
+                          confidence: 1
+                        lembur:
+                          value: 180000
+                          confidence: 1
+                        thr:
+                          confidence: 0
+                        total_pendapatan:
+                          value: 6680000
+                          confidence: 1
+                        total_potongan:
+                          value: 225000
+                          confidence: 1
+                        gaji_bersih:
+                          value: 6455000
+                          confidence: 1
+                        missing_mandatory_fields: []
+                    request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                    guardrails: 0
+                    pipeline_last_stage: scoring
+        '202':
+          description: Masih berjalan
+          content:
+            application/json:
+              examples:
+                processing:
+                  summary: Masih diproses
+                  value:
+                    status_code: 202
+                    status_desc: Accepted
+                    message: OCR job accepted; still processing
+                    request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                    pipeline_last_stage: structuring
+              schema:
+                $ref: '#/components/schemas/ExtractOcrResponse'
+        '400':
+          description: 'Ditahan guardrail atau ditolak aturan structuring (`DOWNSTREAM_VALIDATION_ERROR`,
+            `guardrails: 1`)'
+          content:
+            application/json:
+              example:
+                status_code: 400
+                status_desc: Bad Request
+                message: Dokumen ini bukan slip gaji. Mohon unggah slip gaji.
+                errors: DOWNSTREAM_VALIDATION_ERROR
+                request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                guardrails: 1
+                pipeline_last_stage: guardrails
+              schema:
+                $ref: '#/components/schemas/ExtractOcrResponse'
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: orchestrator
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Tidak ada tahap yang punya job untuk request_id ini
+          content:
+            application/json:
+              example:
+                status_code: 404
+                status_desc: Not Found
+                message: No request found for request_id OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                errors: REQUEST_ID_NOT_FOUND
+                pipeline_last_stage: orchestrator
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Sebuah tahap gagal (`OCR_FAILED`, `STRUCTURING_FAILED`, `SCORING_FAILED`)
+          content:
+            application/json:
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: tidak ada teks OCR yang bisa distrukturkan
+                errors: STRUCTURING_FAILED
+                request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                guardrails: 0
+                pipeline_last_stage: structuring
+              schema:
+                $ref: '#/components/schemas/ExtractOcrResponse'
+        '500':
+          description: Sebuah tahap menjawab bentuk tak terduga
+          content:
+            application/json:
+              example:
+                status_code: 500
+                status_desc: Internal Server Error
+                message: 'structuring service error (401): Invalid or missing API key'
+                errors: 'structuring service error (401): Invalid or missing API key'
+                pipeline_last_stage: orchestrator
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Sebuah tahap tidak terjangkau
+          content:
+            application/json:
+              example:
+                status_code: 503
+                status_desc: Service Unavailable
+                message: structuring service is unavailable
+                errors: structuring service is unavailable
+                pipeline_last_stage: orchestrator
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: Sebuah tahap tidak menjawab tepat waktu
+          content:
+            application/json:
+              example:
+                status_code: 504
+                status_desc: Gateway Timeout
+                message: structuring service timed out after 10.0s
+                errors: structuring service timed out after 10.0s
+                pipeline_last_stage: orchestrator
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  schemas:
+    Body_extractOcr:
+      properties:
+        request_id:
+          type: string
+          title: Request Id
+          description: request_id yang dibuat Orkestrasi pusat
+          examples:
+          - OCR_9cb01af2-493d-446d-b191-af120333f6d0
+        document_type:
+          type: string
+          title: Document Type
+          description: Hanya `slip_gaji`; selain itu 400 `UNSUPPORTED_DOCUMENT_TYPE`
+          default: slip_gaji
+          examples:
+          - slip_gaji
+        file:
+          anyOf:
+          - type: string
+            format: binary
+          - type: string
+          - type: 'null'
+          title: File
+          description: Document image (JPEG/PNG/PDF). Omit when sending file_url.
+        file_url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: File Url
+          description: URL this service fetches the document image from (e.g. a presigned MinIO GET).
+            Omit when uploading file. The host must be listed in the service's `FILE_URL_ALLOWED_HOSTS`,
+            or resolve to a public address when that is empty; redirects are not followed.
+        params:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Params
+          description: Metadata klien (JSON object atau string berkutip), dikembalikan apa adanya di `params`
+          examples:
+          - '{"nik": "3123456711950001", "refno": "PK19039Y8U"}'
+        pipeline_name_sequence:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Pipeline Name Sequence
+          description: 'Service yang dijalankan, berurutan: `guardrails`, `extraction`, `structuring`,
+            `scoring` — JSON array atau field berulang. Tidak dikirim: keempatnya'
+          examples:
+          - '["guardrails","extraction","structuring","scoring"]'
+        guardrails_confidence_threshold:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Guardrails Confidence Threshold
+          description: 'Angka (0-1) untuk guardrail-identity, atau JSON per guardrail `{"identity": 0.8,
+            "blur": 0.7}` (`acc_rej` = `identity`). Tidak dikirim: ambang bawaan tiap service guardrail'
+          examples:
+          - '0.8'
+        guardrails_tendency:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Guardrails Tendency
+          description: 'Berpasangan dengan ambang di atas. `accepted` (bawaan): lolos bila P(accept) >=
+            ambang. `rejected`: ditolak bila P(reject) >= ambang'
+          examples:
+          - accepted
+        column_confidence_threshold:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Column Confidence Threshold
+          description: 'JSON per field, sisi accept, mis. `{"gaji_bersih": 0.9, "all_field": 0.6}`. Field
+            yang tidak disebut: `all_field`, lalu `FIELD_CONFIDENCE_THRESHOLD` (0,5)'
+          examples:
+          - '{"all_field": 0.5}'
+      type: object
+      required:
+      - request_id
+      title: Body_extractOcr
+    ContractField:
+      properties:
+        value:
+          title: Value
+          description: Nilai yang terbaca; null bila field tidak ditemukan. Nominal uang berupa integer
+            rupiah
+          examples:
+          - PT SUMBER REJEKI MAKMUR
+        confidence:
+          type: integer
+          enum:
+          - 0
+          - 1
+          title: Confidence
+          description: '1 ketika probabilitas model keyakinan (0-1) mencapai ambang field ini: `column_confidence_threshold`
+            permintaan, atau `FIELD_CONFIDENCE_THRESHOLD` (bawaan 0,5); 0 ketika lebih rendah, atau ketika
+            tidak ada nilainya. Terukur out-of-fold pada ambang 0,80: precision 93,4%, recall 75,6%'
+          examples:
+          - 1
+      type: object
+      required:
+      - confidence
+      title: ContractField
+    ErrorResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          examples:
+          - 400
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          examples:
+          - Bad Request
+        message:
+          type: string
+          title: Message
+          description: Human-readable cause; safe to log
+          examples:
+          - Uploaded file is empty
+        data:
+          type: 'null'
+          title: Data
+          description: Always null on error
+        errors:
+          type: string
+          title: Errors
+          description: Machine-readable cause. `VALIDATION_ERROR` for 422 (branch on this, the message
+            names a different field every time); for every other status it repeats `message`
+          examples:
+          - Uploaded file is empty
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: Present when the error is tied to a known request_id
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+      type: object
+      required:
+      - status_code
+      - status_desc
+      - message
+      - errors
+      title: ErrorResponse
+      description: Every error response.
+    ExtractOcrResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Sama dengan kode status HTTP
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Frasa standar HTTP untuk `status_code`
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Untuk dibaca manusia; kalimatnya bisa berubah, jadi bercabanglah pada `errors`
+          examples:
+          - OCR extraction completed successfully
+        data:
+          anyOf:
+          - $ref: '#/components/schemas/SlipGajiData'
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Data
+          description: 'Pipeline penuh (atau berakhir di `scoring`): `{total_slip, slip[]}`, tiap field
+            `{value, confidence 0/1}`. Berakhir lebih awal: hasil service terakhir apa adanya — `["guardrails"]`
+            laporan guardrail `{passed, reason, document, pages, checks, skipped, unavailable}`; `extraction`
+            hasil OCR `{engine, model, elapsed_ms, n_pages, full_text, pages}`; `structuring` `{document_type,
+            total_slip, slips, llm_used, reject_reason}`. Null bila gagal atau masih diproses'
+        errors:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Errors
+          description: Kode kegagalan ketika permintaan gagal atau ditolak; null selain itu
+          examples:
+          - null
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: request_id milik respons ini
+        guardrails:
+          anyOf:
+          - type: integer
+            enum:
+            - 0
+            - 1
+          - type: 'null'
+          title: Guardrails
+          description: 1 = ditolak (ketiga guardrail, atau aturan structuring), 0 = tidak ditolak, null
+            = masih diproses atau error sebelum dokumen dinilai
+          examples:
+          - 0
+        pipeline_last_stage:
+          anyOf:
+          - type: string
+            enum:
+            - orchestrator
+            - guardrails
+            - extraction
+            - structuring
+            - scoring
+          - type: 'null'
+          title: Pipeline Last Stage
+          description: 'Service asal jawaban, dengan nama yang sama seperti di `pipeline_name_sequence`:
+            service yang menyelesaikan, menolak, gagal, atau sedang berjalan — atau `orchestrator` bila
+            permintaan ditolak pintu masuk sendiri sebelum satu pun service pipeline dipanggil (kunci
+            API, berkas, parameter, request_id tidak dikenal pada `GET`). Penolakan guardrail-blank /
+            -blur / -identity dilaporkan sebagai `guardrails`.'
+          examples:
+          - scoring
+        params:
+          title: Params
+          description: '`params` yang dikirim bersama `POST /v1/extract-ocr`, dikembalikan apa adanya;
+            null bila tidak dikirim. Tidak disimpan, jadi selalu null pada `GET /v1/extract-ocr/{request_id}`'
+          examples:
+          - nik: '3123456711950001'
+            refno: PK19039Y8U
+      type: object
+      required:
+      - status_code
+      - status_desc
+      - message
+      title: ExtractOcrResponse
+    HealthResponse:
+      properties:
+        status:
+          type: string
+          title: Status
+          description: '`healthy` (HTTP 200) or `unhealthy` (HTTP 503)'
+          examples:
+          - healthy
+        version:
+          type: string
+          title: Version
+          description: Service version
+          examples:
+          - 1.0.0
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Detail
+          description: The cause when `unhealthy`; null when healthy
+          examples:
+          - null
+        device:
+          type: string
+          title: Device
+          description: Where this service computes
+          examples:
+          - cpu
+        backends:
+          additionalProperties:
+            type: string
+          type: object
+          title: Backends
+          description: Active implementation per concern (model backend, storage). Useful to confirm a
+            deployment
+          examples:
+          - ekstraksi: paddle
+            storage: postgres
+      type: object
+      required:
+      - status
+      - version
+      - device
+      - backends
+      title: HealthResponse
+      description: '`GET /health`.'
+    ReadyResponse:
+      properties:
+        status:
+          type: string
+          enum:
+          - ready
+          - not_ready
+          title: Status
+          description: '`ready` (HTTP 200) when every check is `ok`, else `not_ready` (HTTP 503)'
+          examples:
+          - ready
+        checks:
+          additionalProperties:
+            type: string
+            enum:
+            - ok
+            - failed
+          type: object
+          title: Checks
+          description: One entry per REQUIRED dependency of this service; empty when it has none
+          examples:
+          - database: ok
+      type: object
+      required:
+      - status
+      - checks
+      title: ReadyResponse
+      description: '`GET /ready`.'
+    Slip:
+      properties:
+        page:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Page
+          description: Halaman asal slip ini
+          examples:
+          - 1
+        nama_perusahaan:
+          $ref: '#/components/schemas/ContractField'
+          description: Nama perusahaan pemberi kerja, apa adanya termasuk bentuk badan usaha (PT, CV)
+            **Wajib**.
+          examples:
+          - confidence: 1
+            value: PT SUMBER REJEKI MAKMUR
+        periode:
+          $ref: '#/components/schemas/ContractField'
+          description: Periode gaji, dinormalkan ke `YYYY-MM` **Wajib**.
+          examples:
+          - confidence: 1
+            value: 2025-02
+        nama_karyawan:
+          $ref: '#/components/schemas/ContractField'
+          description: Nama karyawan **Wajib**.
+          examples:
+          - confidence: 1
+            value: ANDI SAPUTRA
+        nomor_induk_karyawan:
+          $ref: '#/components/schemas/ContractField'
+          description: Nomor induk karyawan / NIK internal perusahaan
+          examples:
+          - confidence: 1
+        jabatan:
+          $ref: '#/components/schemas/ContractField'
+          description: Jabatan
+          examples:
+          - confidence: 1
+        divisi:
+          $ref: '#/components/schemas/ContractField'
+          description: Divisi / departemen
+          examples:
+          - confidence: 1
+        status_pegawai:
+          $ref: '#/components/schemas/ContractField'
+          description: Status kepegawaian (mis. Tetap, Kontrak)
+          examples:
+          - confidence: 1
+        gaji_pokok:
+          $ref: '#/components/schemas/ContractField'
+          description: Gaji pokok, rupiah **Wajib**.
+          examples:
+          - confidence: 1
+            value: 4500000
+        tunjangan_jabatan:
+          $ref: '#/components/schemas/ContractField'
+          description: Tunjangan jabatan, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        tunjangan_transport:
+          $ref: '#/components/schemas/ContractField'
+          description: Tunjangan transport, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        tunjangan_makan:
+          $ref: '#/components/schemas/ContractField'
+          description: Tunjangan makan, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        tunjangan_komunikasi:
+          $ref: '#/components/schemas/ContractField'
+          description: Tunjangan komunikasi, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        tunjangan_lain:
+          $ref: '#/components/schemas/ContractField'
+          description: Tunjangan lain-lain, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        bonus:
+          $ref: '#/components/schemas/ContractField'
+          description: Bonus, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        insentif:
+          $ref: '#/components/schemas/ContractField'
+          description: Insentif, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        lembur:
+          $ref: '#/components/schemas/ContractField'
+          description: Upah lembur, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        thr:
+          $ref: '#/components/schemas/ContractField'
+          description: Tunjangan hari raya, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        total_pendapatan:
+          $ref: '#/components/schemas/ContractField'
+          description: Total pendapatan sebelum potongan, rupiah **Wajib**.
+          examples:
+          - confidence: 1
+            value: 6680000
+        total_potongan:
+          $ref: '#/components/schemas/ContractField'
+          description: Total potongan, rupiah
+          examples:
+          - confidence: 1
+            value: 0
+        gaji_bersih:
+          $ref: '#/components/schemas/ContractField'
+          description: Gaji bersih yang diterima; diturunkan bila tidak tercetak (total pendapatan − total
+            potongan) **Wajib**.
+          examples:
+          - confidence: 1
+            value: 6455000
+        missing_mandatory_fields:
+          items:
+            type: string
+          type: array
+          title: Missing Mandatory Fields
+          description: Field wajib yang tidak terisi pada slip ini; daftar kosong berarti lengkap
+          examples:
+          - []
+      type: object
+      required:
+      - nama_perusahaan
+      - periode
+      - nama_karyawan
+      - nomor_induk_karyawan
+      - jabatan
+      - divisi
+      - status_pegawai
+      - gaji_pokok
+      - tunjangan_jabatan
+      - tunjangan_transport
+      - tunjangan_makan
+      - tunjangan_komunikasi
+      - tunjangan_lain
+      - bonus
+      - insentif
+      - lembur
+      - thr
+      - total_pendapatan
+      - total_potongan
+      - gaji_bersih
+      title: Slip
+      description: 'Satu slip gaji: 20 field ber-`{value, confidence}`, halamannya, dan field wajib yang
+        kosong.'
+    SlipGajiData:
+      properties:
+        total_slip:
+          type: integer
+          minimum: 0.0
+          title: Total Slip
+          description: Jumlah slip di dokumen ini. Satu berkas lazim memuat tiga bulan berturut-turut
+          examples:
+          - 3
+        slip:
+          items:
+            $ref: '#/components/schemas/Slip'
+          type: array
+          title: Slip
+          description: 'Satu entri per slip, urut halaman. Setiap entri berdiri sendiri: totalnya milik
+            bulan itu saja'
+      type: object
+      required:
+      - total_slip
+      - slip
+      title: SlipGajiData
+  securitySchemes:
+    APIKeyHeader:
+      type: apiKey
+      description: API key for this service
+      in: header
+      name: X-API-Key
+tags:
+- name: Extract OCR
+  description: Mulai pipeline untuk sebuah dokumen, dan baca posisi permintaan
+- name: Health
+  description: Health and readiness checks; no API key
