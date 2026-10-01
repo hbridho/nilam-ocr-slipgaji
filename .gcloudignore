@@ -1,0 +1,37 @@
+# Apa yang TIDAK diunggah ke Cloud Build. Tanpa berkas ini gcloud mengunggah seluruh folder —
+# 463 MB, hampir semuanya .venv — dan biasanya ia memakai .gitignore sebagai acuan, tetapi folder
+# ini bukan git repo, jadi tidak ada acuan sama sekali. Dengan daftar di bawah: 2,6 MB.
+#
+# HATI-HATI. Berkas ini menyaring SEBELUM docker, jadi apa pun yang dibuang di sini tidak akan ada
+# di build context — dan `.dockerignore` tidak bisa mengembalikannya. Jangan pernah menambahkan
+# pola `pyproject.toml` di sini: tiap Dockerfile memasang pustaka lokal dengan
+# `pip install ./libs/<nama>`, dan tanpa pyproject.toml di context pip berhenti dengan
+# "Neither 'setup.py' nor 'pyproject.toml' found". `scripts/check_images.py` memeriksa itu.
+#
+# Penyaringan sebenarnya tetap dikerjakan .dockerignore; yang di sini hanya untuk tidak mengunggah
+# ratusan megabita yang tidak ada hubungannya.
+
+.git
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+.vscode
+.idea
+**/node_modules
+
+# Rahasia: tidak boleh ikut ke mana pun. `.env.example` tidak memuat nilai, jadi boleh ikut.
+**/.env
+
+# Keluaran lokal dan data orang.
+local/logs
+tools/load-tester/assets
+tools/load-tester/out
+tools/tracker/.port-forward.log
+docs
+
+.DS_Store

@@ -1,0 +1,26 @@
+.git
+.gitignore
+.venv
+**/.venv
+**/.env
+**/.env.example
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.ruff_cache
+**/tests
+**/openapi.yaml
+**/pyproject.toml
+# Keduanya WAJIB lolos: Dockerfile memasangnya dengan `pip install ./libs/<nama>`, dan tanpa
+# pyproject.toml di build context pip berhenti dengan "Neither 'setup.py' nor 'pyproject.toml'
+# found" — build gagal, bukan image yang diam-diam kurang isi.
+!libs/ocr_common/pyproject.toml
+!libs/slip_ml/pyproject.toml
+**/Dockerfile
+docker-compose*.yml
+.dockerignore
+Makefile
+README.md
+requirements-dev.txt
+scripts

@@ -1,0 +1,133 @@
+# Seven services, one per Bitbucket repo (ms-bribrain-nilam-ocr-slipgaji-<service>).
+# Copy each services/<service>/.env.example to .env first (the .env files are never committed).
+x-common: &common
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  # Pintu masuk: satu-satunya service yang dipanggil Orkestrasi pusat.
+  orchestrator:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    image: ms-bribrain-nilam-ocr-slipgaji-orchestrator:latest
+    container_name: ms-bribrain-nilam-ocr-slipgaji-orchestrator
+    env_file:
+      - path: services/orchestrator/.env
+        required: false
+    environment:
+      PORT: "8034"
+      EXTRACTION_SERVICE_URL: http://extraction:8030
+      STRUCTURING_SERVICE_URL: http://structuring:8032
+      SCORING_SERVICE_URL: http://scoring:8033
+    ports:
+      - "127.0.0.1:8034:8034"
+    depends_on:
+      - extraction
+
+  # OCR, lalu ketiga guardrail bersamaan (mereka membaca teks OCR), lalu serah ke structuring.
+  extraction:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/extraction/Dockerfile
+    image: ms-bribrain-nilam-ocr-slipgaji-extraction:latest
+    container_name: ms-bribrain-nilam-ocr-slipgaji-extraction
+    env_file:
+      - path: services/extraction/.env
+        required: false
+    environment:
+      PORT: "8030"
+      STRUCTURING_SERVICE_URL: http://structuring:8032
+      GUARDRAIL_BLANK_URL: http://guardrail-blank:8035
+      GUARDRAIL_BLUR_URL: http://guardrail-blur:8036
+      GUARDRAIL_IDENTITY_URL: http://guardrail-identity:8037
+    ports:
+      - "127.0.0.1:8030:8030"
+    depends_on:
+      - structuring
+      - guardrail-blank
+      - guardrail-blur
+      - guardrail-identity
+
+  # Tiga guardrail, tiga service. Masing-masing bisa dimatikan sendiri (GUARDRAIL_<NAMA>_ENABLED=false di
+  # extraction, atau hentikan containernya): dua yang lain tetap memutuskan. Tidak ada yang punya basis data.
+  guardrail-blank:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/guardrail-blank/Dockerfile
+    image: ms-bribrain-nilam-ocr-slipgaji-guardrail-blank:latest
+    container_name: ms-bribrain-nilam-ocr-slipgaji-guardrail-blank
+    env_file:
+      - path: services/guardrail-blank/.env
+        required: false
+    environment:
+      PORT: "8035"
+    ports:
+      - "127.0.0.1:8035:8035"
+
+  guardrail-blur:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/guardrail-blur/Dockerfile
+    image: ms-bribrain-nilam-ocr-slipgaji-guardrail-blur:latest
+    container_name: ms-bribrain-nilam-ocr-slipgaji-guardrail-blur
+    env_file:
+      - path: services/guardrail-blur/.env
+        required: false
+    environment:
+      PORT: "8036"
+    ports:
+      - "127.0.0.1:8036:8036"
+
+  guardrail-identity:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/guardrail-identity/Dockerfile
+    image: ms-bribrain-nilam-ocr-slipgaji-guardrail-identity:latest
+    container_name: ms-bribrain-nilam-ocr-slipgaji-guardrail-identity
+    env_file:
+      - path: services/guardrail-identity/.env
+        required: false
+    environment:
+      PORT: "8037"
+    ports:
+      - "127.0.0.1:8037:8037"
+
+  structuring:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/structuring/Dockerfile
+    image: ms-bribrain-nilam-ocr-slipgaji-structuring:latest
+    container_name: ms-bribrain-nilam-ocr-slipgaji-structuring
+    env_file:
+      - path: services/structuring/.env
+        required: false
+    environment:
+      PORT: "8032"
+      SCORING_SERVICE_URL: http://scoring:8033
+    ports:
+      - "127.0.0.1:8032:8032"
+    depends_on:
+      - scoring
+
+  scoring:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/scoring/Dockerfile
+    image: ms-bribrain-nilam-ocr-slipgaji-scoring:latest
+    container_name: ms-bribrain-nilam-ocr-slipgaji-scoring
+    env_file:
+      - path: services/scoring/.env
+        required: false
+    environment:
+      PORT: "8033"
+    ports:
+      - "127.0.0.1:8033:8033"
