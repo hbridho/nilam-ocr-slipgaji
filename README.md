@@ -1,8 +1,8 @@
 # nilam-ocr-slipgaji
 
 Layanan OCR **slip gaji** untuk NILAM (BRIBrain). Berkas slip gaji masuk, keluar 20 field per slip
-beserta `confidence` 0/1. Kontraknya mengikuti **API spec [07] NPWP** (envelope, `pipeline_name_sequence`,
-threshold 0–1, kode error, callback), dengan `data` berbentuk slip gaji (satu berkas bisa berisi beberapa slip).
+beserta `confidence` 0/1. (envelope, `pipeline_name_sequence`, threshold 0–1, kode error, callback), 
+dengan `data` berbentuk slip gaji (satu berkas bisa berisi beberapa slip).
 
 ## Service
 
@@ -59,7 +59,7 @@ flowchart TD
     O -.->|GET status| E & S & SC
 ```
 
-**Guardrail berjalan SETELAH OCR**, bukan sebelumnya seperti NPWP: modelnya membaca teks OCR (AUC 0,911)
+**Guardrail berjalan SETELAH OCR**, modelnya membaca teks OCR (AUC 0,911)
 dan bukan piksel (0,638). Di kontrak, namanya tetap `guardrails` dan penolakannya dilaporkan
 `pipeline_last_stage: guardrails`.
 
