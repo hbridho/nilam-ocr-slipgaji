@@ -1,0 +1,20 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic-settings==2.5.2
+httpx==0.27.2
+sqlalchemy==2.0.52
+greenlet==3.2.4
+asyncpg==0.31.0
+numpy==2.3.5
+openpyxl==3.1.5
+rapidfuzz==3.14.3
+# Dependensi slip_ml, yang dipasang `--no-deps` sehingga dependensinya TIDAK ikut terbawa.
+# `requests` dibutuhkan kedua jalur LLM: backend `http` memakainya langsung, dan jalur `bedrock`
+# memakainya untuk token Entra ID serta gateway Mantle.
+requests==2.32.3
+# Hanya untuk LLM_BACKEND=bedrock (STS + bedrock-runtime). Ikut dipasang meski ENABLE_LLM=false,
+# dan itu menambah ~90 MB ke image — disengaja: ENABLE_LLM diiklankan sebagai saklar yang bisa
+# dinyalakan lewat environment, dan saklar yang tidak bisa menyala lebih buruk daripada image
+# yang lebih besar. Buang baris ini kalau lingkungan Anda hanya memakai LLM_BACKEND=http.
+boto3==1.43.106

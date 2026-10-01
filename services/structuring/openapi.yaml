@@ -1,0 +1,1873 @@
+openapi: 3.1.0
+info:
+  title: OCR Slip Gaji Structuring API
+  description: 'Tahap kedua pipeline slip gaji: teks OCR per halaman menjadi **20 field** slip gaji.
+
+
+    **Satu halaman = satu slip.** Berkas yang memuat tiga bulan menghasilkan tiga slip, masing-masing
+    dengan totalnya sendiri; menggabungkannya akan mencampur komponen satu bulan ke total bulan lain.
+
+
+    Dua lapis, sama dengan pipeline penelitian: aturan (sinonim label, pembacaan kolom, turunan aritmetika
+    gaji bersih = total pendapatan − total potongan) dan, bila `ENABLE_LLM` menyala, arbitrase nilai uang
+    lewat Bedrock. Terukur pada 50 dokumen berlabel: aturan saja 81,5% field benar, dengan arbitrase 89,9%.
+    LLM mati secara default supaya service bisa berjalan tanpa kredensial AWS.
+
+
+    **Pipeline asinkron:** service OCR POST /v1/structuring/jobs dan menerima 202; service ini bekerja
+    di latar, menyimpan hasilnya, mengirim callback ke orchestrator, lalu menyerahkan job ke service scoring.
+    /v1/structuring/structure melakukan pekerjaan yang sama secara sinkron. Semua endpoint kecuali /health
+    memerlukan header X-API-Key.
+
+
+    ## Conventions (the same for every nilam-ocr service)
+
+
+    **Authentication.** Every endpoint except `/health`, `/ready` and `/metrics` requires the header `X-API-Key`.
+
+    A missing or wrong key answers `401`. The services are reachable only from inside the cluster.
+
+
+    **Envelope.** Every JSON response, success or error, has the same shape:
+
+    `{status_code, status_desc, message, data, errors, request_id}`. `status_code` always equals the HTTP
+
+    status. On success `errors` is null; on error `data` is null.
+
+
+    **Errors.** `errors` is a stable, machine-readable code; branch on it, not on the wording of `message`.
+
+    The document checks: `EMPTY_FILE`, `UNSUPPORTED_FILE_TYPE`, `UNREADABLE_FILE`, `TOO_MANY_PAGES`,
+
+    `INVALID_FILE_SOURCE`, `FILE_URL_REJECTED` (400), `FILE_TOO_LARGE` (413). Otherwise the code of the
+    status:
+
+    `UNAUTHORIZED` (401), `REQUEST_ID_NOT_FOUND` (404, an unknown request_id), `NOT_FOUND` (404, a path
+    that does
+
+    not exist), `METHOD_NOT_ALLOWED` (405), `VALIDATION_ERROR` (422), `INTERNAL_SERVER_ERROR` (500),
+
+    `DOWNSTREAM_UNAVAILABLE` (503), `DOWNSTREAM_TIMEOUT` (504), unless an endpoint documents a more precise
+    one.
+
+    `400` = the request or the document is unusable (do not retry unchanged). `503` / `504` are safe to
+    retry.
+
+
+    **request_id.** Minted by the central orchestrator and carried through every stage. Where an endpoint
+    has
+
+    no request_id of its own, the `X-Request-ID` request header is used (and echoed in the response header);
+
+    without it the service generates one.
+
+
+    **Asynchronous stages** (internal: only the orchestrator SLIP_GAJI and the previous stage call them).
+    `POST
+
+    .../jobs` answers `202` immediately and does the work in the background. The outcome is reported by
+    a
+
+    callback to the central orchestrator (see *Webhooks*), and can be read at any time with
+
+    `GET .../jobs/{request_id}`, which the orchestrator SLIP_GAJI''s `GET /v1/extract-ocr/{request_id}`
+    combines
+
+    over the three stages. Submitting the same request_id again is idempotent:
+
+    `202` with `duplicate: true`, the work is not repeated, unless the earlier attempt `FAILED` or has
+    been
+
+    `PROCESSING` for longer than the job lease (`PIPELINE_JOB_LEASE_SECONDS`, 5 minutes by default: the
+
+    process running it died). A job still running when the service shuts down is reported `FAILED`. Because
+
+    the request was already answered `202`, a problem with the document itself (unreadable file, no text,
+
+    unsupported document type) shows up as a `FAILED` job and callback, not as a `4xx`.
+
+    '
+  version: 1.0.0
+servers:
+- url: /
+  description: This host (where this page is served)
+- url: http://ms-bribrain-nilam-ocr-slipgaji-structuring.{namespace}.svc.cluster.local:8032
+  description: GKE, from inside the release's namespace (the other services of this pipeline)
+  variables:
+    namespace:
+      default: ms-bribrain-nilam-ocr-slipgaji
+      description: 'Namespace of the Helm release (deploy/helm/deploy.sh: nilam-ocr-slipgaji)'
+- url: http://structuring:8032
+  description: The Docker Compose network
+- url: http://127.0.0.1:8032
+  description: Local development
+paths:
+  /health:
+    get:
+      tags:
+      - Health
+      summary: Health check, including the database
+      description: 'Says whether the service can reach what it depends on: 200 `healthy` when every dependency
+        it checks answers (the database, for a service that has one), 503 `unhealthy` with the cause in
+        `detail` otherwise. Each check gives up after 3 s. Also lists the active implementations (`backends`).
+        Not used by the Kubernetes probes: liveness and startup check the port, readiness is `/ready`.
+        Does not require an API key.'
+      operationId: getHealth
+      responses:
+        '200':
+          description: Every dependency answers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                healthy:
+                  summary: Healthy
+                  value:
+                    status: healthy
+                    version: 1.0.0
+                    device: cpu
+                    backends:
+                      structuring: slip_rules
+                      storage: postgres
+        '503':
+          description: A dependency does not answer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: unhealthy
+                version: 1.0.0
+                detail: database unreachable
+                device: cpu
+                backends:
+                  structuring: slip_rules
+                  storage: postgres
+  /ready:
+    get:
+      tags:
+      - Health
+      summary: Readiness probe
+      description: 'The readiness probe. Liveness is checked on the port, never on a dependency (a database
+        blip must not make Kubernetes restart every pod). /ready says whether this pod can do its job
+        right now: 200 when every REQUIRED dependency of this service answers, 503 otherwise, so the pod
+        is taken out of the Service until it recovers. Downstream stages and model services are deliberately
+        not checked: their outage is reported per job, not by refusing traffic. Does not require an API
+        key.'
+      operationId: getReadiness
+      responses:
+        '200':
+          description: Every required dependency answers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              examples:
+                ready:
+                  summary: Ready
+                  value:
+                    status: ready
+                    checks:
+                      database: ok
+        '503':
+          description: A required dependency is unavailable; the pod is taken out of the Service
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              example:
+                status: not_ready
+                checks:
+                  database: failed
+  /metrics:
+    get:
+      tags:
+      - Health
+      summary: Prometheus metrics
+      description: 'Prometheus text exposition of this process: `http_requests_total` and `http_request_duration_seconds`
+        per route template, and for the pipeline stages `pipeline_jobs_total` (by outcome), `pipeline_job_duration_seconds`,
+        `pipeline_stale_jobs_reclaimed_total`, `pipeline_outbox_deliveries_total` and the outbox backlog
+        gauges (`pipeline_outbox_pending`, `_retrying`, `_dead_letters`, `_oldest_pending_seconds`). Scraped
+        inside the cluster; does not require an API key.'
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Metrics in the Prometheus text format
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/structuring/jobs:
+    post:
+      tags:
+      - Pipeline
+      summary: Serahkan hasil OCR ke tahap structuring
+      description: '**Langkah 2 pipeline, asinkron. Dipanggil service OCR, bukan oleh orchestrator.**
+
+
+        Mencatat job (`structuring_jobs`, idempoten per request_id), menjawab **202 seketika**, lalu di
+        latar: mengubah teks OCR tiap halaman menjadi 20 field slip gaji, menyimpan hasilnya (`structuring_results`),
+        mengirim callback `STRUCTURING`, dan menyerahkan job (laporan guardrail + hasil OCR + hasil structuring)
+        ke service scoring.
+
+
+        **Satu halaman = satu slip**: berkas tiga bulan menghasilkan tiga slip, masing-masing dengan 20
+        fieldnya sendiri. Dokumen tanpa satu pun halaman berteks menggagalkan job dengan alasannya.'
+      operationId: submitStructuringJob
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StructuringJobRequest'
+        required: true
+      responses:
+        '202':
+          description: The job was accepted (or already existed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobAcceptedResponse'
+              examples:
+                accepted:
+                  summary: New job
+                  value:
+                    status_code: 202
+                    status_desc: Accepted
+                    message: Accepted
+                    data:
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      stage: STRUCTURING
+                      status: PROCESSING
+                      duplicate: false
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                duplicate:
+                  summary: 'Same request_id sent again: nothing is re-run'
+                  value:
+                    status_code: 202
+                    status_desc: Accepted
+                    message: Accepted
+                    data:
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      stage: STRUCTURING
+                      status: DONE
+                      duplicate: true
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: structuring
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'body.request_id: Field required'
+                errors: VALIDATION_ERROR
+                pipeline_last_stage: structuring
+      security:
+      - APIKeyHeader: []
+  /v1/structuring/jobs/{request_id}:
+    get:
+      tags:
+      - Pipeline
+      summary: Status dan hasil tahap structuring
+      description: 'Status tahap ini saja, beserta slip yang sudah terstruktur setelah `DONE`. Internal:
+        orchestrator membacanya (selama menunggu, dan untuk `GET /v1/extract-ocr/{request_id}`), dan berguna
+        untuk menelusuri masalah.'
+      operationId: getStructuringJob
+      security:
+      - APIKeyHeader: []
+      parameters:
+      - name: request_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Request Id
+      responses:
+        '200':
+          description: The job exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StructuringJobStatusResponse'
+              examples:
+                done:
+                  summary: Finished
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      stage: STRUCTURING
+                      created_at: '2026-09-18T04:00:01+00:00'
+                      status: DONE
+                      result:
+                        document_type: slip_gaji
+                        n_slips: 3
+                        slips:
+                        - slip_no: 1
+                          page: 1
+                          fields:
+                            nama_perusahaan: PT SUMBER REJEKI MAKMUR
+                            periode: 2025-02
+                            nama_karyawan: ANDI SAPUTRA
+                            nomor_induk_karyawan: '202309001'
+                            jabatan: Staff Gudang
+                            status_pegawai: Tetap
+                            gaji_pokok: 4500000
+                            tunjangan_jabatan: 500000
+                            tunjangan_transport: 300000
+                            tunjangan_makan: 600000
+                            lembur: 180000
+                            total_pendapatan: 6080000
+                            total_potongan: 225000
+                            gaji_bersih: 5855000
+                          source:
+                            gaji_pokok:
+                              how: regex
+                              label: gaji pokok
+                              line_no: 9
+                              line: Gaji Pokok  Rp 4.500.000
+                            gaji_bersih:
+                              how: derived
+                          checks:
+                            earnings:
+                            - ok
+                            netpay:
+                            - ok
+                          counts:
+                            filled: 13
+                            by_regex: 12
+                            by_derived: 1
+                            by_llm: 0
+                            chars: 612
+                          llm:
+                            used: false
+                            asked: false
+                            compare: {}
+                            disagree: []
+                          missing_mandatory_fields: []
+                        - slip_no: 2
+                          page: 2
+                          fields:
+                            nama_perusahaan: PT SUMBER REJEKI MAKMUR
+                            periode: 2025-02
+                            nama_karyawan: ANDI SAPUTRA
+                            nomor_induk_karyawan: '202309001'
+                            jabatan: Staff Gudang
+                            status_pegawai: Tetap
+                            gaji_pokok: 4500000
+                            tunjangan_jabatan: 500000
+                            tunjangan_transport: 300000
+                            tunjangan_makan: 600000
+                            lembur: 180000
+                            total_pendapatan: 6080000
+                            total_potongan: 225000
+                            gaji_bersih: 5855000
+                          source:
+                            gaji_pokok:
+                              how: regex
+                              label: gaji pokok
+                              line_no: 9
+                              line: Gaji Pokok  Rp 4.500.000
+                            gaji_bersih:
+                              how: derived
+                          checks:
+                            earnings:
+                            - ok
+                            netpay:
+                            - ok
+                          counts:
+                            filled: 13
+                            by_regex: 12
+                            by_derived: 1
+                            by_llm: 0
+                            chars: 612
+                          llm:
+                            used: false
+                            asked: false
+                            compare: {}
+                            disagree: []
+                          missing_mandatory_fields: []
+                        - slip_no: 3
+                          page: 3
+                          fields:
+                            nama_perusahaan: PT SUMBER REJEKI MAKMUR
+                            periode: 2025-02
+                            nama_karyawan: ANDI SAPUTRA
+                            nomor_induk_karyawan: '202309001'
+                            jabatan: Staff Gudang
+                            status_pegawai: Tetap
+                            gaji_pokok: 4500000
+                            tunjangan_jabatan: 500000
+                            tunjangan_transport: 300000
+                            tunjangan_makan: 600000
+                            lembur: 180000
+                            total_pendapatan: 6080000
+                            total_potongan: 225000
+                            gaji_bersih: 5855000
+                          source:
+                            gaji_pokok:
+                              how: regex
+                              label: gaji pokok
+                              line_no: 9
+                              line: Gaji Pokok  Rp 4.500.000
+                            gaji_bersih:
+                              how: derived
+                          checks:
+                            earnings:
+                            - ok
+                            netpay:
+                            - ok
+                          counts:
+                            filled: 13
+                            by_regex: 12
+                            by_derived: 1
+                            by_llm: 0
+                            chars: 612
+                          llm:
+                            used: false
+                            asked: false
+                            compare: {}
+                            disagree: []
+                          missing_mandatory_fields: []
+                        llm_used: false
+                        elapsed_ms: 227.5
+                      updated_at: '2026-09-18T04:00:01+00:00'
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                failed:
+                  summary: 'Gagal: tidak ada halaman berteks untuk distrukturkan'
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      stage: STRUCTURING
+                      created_at: '2026-09-18T04:00:01+00:00'
+                      status: FAILED
+                      error_message: tidak ada teks OCR yang bisa distrukturkan
+                      updated_at: '2026-09-18T04:00:01+00:00'
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: structuring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No structuring job for this request_id
+          content:
+            application/json:
+              example:
+                status_code: 404
+                status_desc: Not Found
+                message: 'No STRUCTURING job found for request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0'
+                errors: 'No STRUCTURING job found for request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0'
+                request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                pipeline_last_stage: structuring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'path.request_id: Field required'
+                errors: VALIDATION_ERROR
+                request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                pipeline_last_stage: structuring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/structuring/outbox:
+    get:
+      tags:
+      - Pipeline
+      summary: Backlog of this stage's undelivered callbacks and hand-offs
+      description: 'Operational view of the transactional outbox (`PIPELINE_OUTBOX`): how many callbacks
+        and hand-offs of this stage are still to be delivered, how old the oldest one is, and how many
+        were given up on (dead letters). No other service watches the `pipeline_outbox` table, so this
+        is where a monitor should look; the relay also logs a warning when the backlog is older than `PIPELINE_OUTBOX_STALE_AFTER_SECONDS`
+        or a dead letter is waiting.'
+      operationId: getStructuringOutboxStatus
+      responses:
+        '200':
+          description: The backlog of this stage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboxStatusResponse'
+              examples:
+                idle:
+                  summary: Nothing waiting
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      enabled: true
+                      stage: STRUCTURING
+                      pending: 0
+                      retrying: 0
+                      dead_letters: 0
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                backlog:
+                  summary: The orchestrator has been down for a while
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      enabled: true
+                      stage: STRUCTURING
+                      pending: 12
+                      retrying: 12
+                      oldest_pending_seconds: 754.3
+                      dead_letters: 1
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                disabled:
+                  summary: '`PIPELINE_OUTBOX` is off'
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      enabled: false
+                      stage: STRUCTURING
+                      pending: 0
+                      retrying: 0
+                      dead_letters: 0
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: structuring
+      security:
+      - APIKeyHeader: []
+  /v1/structuring/outbox/release:
+    post:
+      tags:
+      - Pipeline
+      summary: Send this stage's dead letters again
+      description: 'Puts the dead letters of this stage back in the outbox queue, due immediately, so
+        the relay delivers them again: use it after the receiver was fixed (for example the orchestrator''s
+        callback contract, or a next stage that was answering 4xx). Optional query `request_id` limits
+        it to one request. A message that fails again goes through the same retry and dead-letter rules.
+        `409` when `PIPELINE_OUTBOX` is off on this service.'
+      operationId: releaseStructuringOutbox
+      security:
+      - APIKeyHeader: []
+      parameters:
+      - name: request_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+      responses:
+        '200':
+          description: Dead letters released
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboxReleaseResponse'
+              examples:
+                released:
+                  summary: One request
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      stage: STRUCTURING
+                      request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                      released: 1
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+                nothing:
+                  summary: Nothing to release
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      stage: STRUCTURING
+                      released: 0
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: structuring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: The outbox is off on this service
+          content:
+            application/json:
+              example:
+                status_code: 409
+                status_desc: Conflict
+                message: 'PIPELINE_OUTBOX is off: there is no outbox to release'
+                errors: 'PIPELINE_OUTBOX is off: there is no outbox to release'
+                pipeline_last_stage: structuring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'query.request_id: Input should be a valid string'
+                errors: VALIDATION_ERROR
+                pipeline_last_stage: structuring
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/structuring/structure:
+    post:
+      tags:
+      - Structuring
+      summary: Ubah teks OCR menjadi field slip gaji, sinkron (tanpa job, tanpa callback)
+      description: 'Memetakan teks OCR per halaman menjadi **20 field slip gaji**, satu himpunan field
+        per halaman.
+
+
+        **Satu halaman = satu slip.** Berkas yang memuat tiga bulan menghasilkan tiga slip, masing-masing
+        dengan totalnya sendiri.
+
+
+        Dua lapis, sama dengan pipeline penelitian: aturan (sinonim label, pembacaan kolom, turunan aritmetika
+        gaji bersih = total pendapatan − total potongan) dan, bila `ENABLE_LLM` menyala, arbitrase nilai
+        uang lewat Bedrock. Terukur pada 50 dokumen berlabel: aturan saja 81,5% field benar, dengan arbitrase
+        89,9%.
+
+
+        `source`, `checks`, `counts` dan `llm.compare` ikut dikembalikan bukan sebagai hiasan: tahap scoring
+        membacanya sebagai fitur model keyakinan.'
+      operationId: structurePages
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StructureRequest'
+        required: true
+      responses:
+        '200':
+          description: Field yang ditemukan
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StructureResponse'
+              examples:
+                tiga_slip:
+                  summary: Satu berkas berisi tiga bulan
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: Success
+                    data:
+                      document_type: slip_gaji
+                      n_slips: 3
+                      slips:
+                      - slip_no: 1
+                        page: 1
+                        fields:
+                          nama_perusahaan: PT SUMBER REJEKI MAKMUR
+                          periode: 2025-02
+                          nama_karyawan: ANDI SAPUTRA
+                          nomor_induk_karyawan: '202309001'
+                          jabatan: Staff Gudang
+                          status_pegawai: Tetap
+                          gaji_pokok: 4500000
+                          tunjangan_jabatan: 500000
+                          tunjangan_transport: 300000
+                          tunjangan_makan: 600000
+                          lembur: 180000
+                          total_pendapatan: 6080000
+                          total_potongan: 225000
+                          gaji_bersih: 5855000
+                        source:
+                          gaji_pokok:
+                            how: regex
+                            label: gaji pokok
+                            line_no: 9
+                            line: Gaji Pokok  Rp 4.500.000
+                          gaji_bersih:
+                            how: derived
+                        checks:
+                          earnings:
+                          - ok
+                          netpay:
+                          - ok
+                        counts:
+                          filled: 13
+                          by_regex: 12
+                          by_derived: 1
+                          by_llm: 0
+                          chars: 612
+                        llm:
+                          used: false
+                          asked: false
+                          compare: {}
+                          disagree: []
+                        missing_mandatory_fields: []
+                      - slip_no: 2
+                        page: 2
+                        fields:
+                          nama_perusahaan: PT SUMBER REJEKI MAKMUR
+                          periode: 2025-02
+                          nama_karyawan: ANDI SAPUTRA
+                          nomor_induk_karyawan: '202309001'
+                          jabatan: Staff Gudang
+                          status_pegawai: Tetap
+                          gaji_pokok: 4500000
+                          tunjangan_jabatan: 500000
+                          tunjangan_transport: 300000
+                          tunjangan_makan: 600000
+                          lembur: 180000
+                          total_pendapatan: 6080000
+                          total_potongan: 225000
+                          gaji_bersih: 5855000
+                        source:
+                          gaji_pokok:
+                            how: regex
+                            label: gaji pokok
+                            line_no: 9
+                            line: Gaji Pokok  Rp 4.500.000
+                          gaji_bersih:
+                            how: derived
+                        checks:
+                          earnings:
+                          - ok
+                          netpay:
+                          - ok
+                        counts:
+                          filled: 13
+                          by_regex: 12
+                          by_derived: 1
+                          by_llm: 0
+                          chars: 612
+                        llm:
+                          used: false
+                          asked: false
+                          compare: {}
+                          disagree: []
+                        missing_mandatory_fields: []
+                      - slip_no: 3
+                        page: 3
+                        fields:
+                          nama_perusahaan: PT SUMBER REJEKI MAKMUR
+                          periode: 2025-02
+                          nama_karyawan: ANDI SAPUTRA
+                          nomor_induk_karyawan: '202309001'
+                          jabatan: Staff Gudang
+                          status_pegawai: Tetap
+                          gaji_pokok: 4500000
+                          tunjangan_jabatan: 500000
+                          tunjangan_transport: 300000
+                          tunjangan_makan: 600000
+                          lembur: 180000
+                          total_pendapatan: 6080000
+                          total_potongan: 225000
+                          gaji_bersih: 5855000
+                        source:
+                          gaji_pokok:
+                            how: regex
+                            label: gaji pokok
+                            line_no: 9
+                            line: Gaji Pokok  Rp 4.500.000
+                          gaji_bersih:
+                            how: derived
+                        checks:
+                          earnings:
+                          - ok
+                          netpay:
+                          - ok
+                        counts:
+                          filled: 13
+                          by_regex: 12
+                          by_derived: 1
+                          by_llm: 0
+                          chars: 612
+                        llm:
+                          used: false
+                          asked: false
+                          compare: {}
+                          disagree: []
+                        missing_mandatory_fields: []
+                      llm_used: false
+                      elapsed_ms: 227.5
+                    request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        '400':
+          description: Tidak ada teks yang bisa distrukturkan
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 400
+                status_desc: Bad Request
+                message: tidak ada teks OCR yang bisa distrukturkan
+                errors: tidak ada teks OCR yang bisa distrukturkan
+                pipeline_last_stage: structuring
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: structuring
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'body.pages: Field required'
+                errors: VALIDATION_ERROR
+                pipeline_last_stage: structuring
+      security:
+      - APIKeyHeader: []
+webhooks:
+  stageCallback:
+    post:
+      tags:
+      - Callbacks
+      summary: Stage status callback (implemented by the orchestrator / gateway)
+      description: '**This is a request this service SENDS, not one it accepts.** The orchestrator must
+        expose it.
+
+
+        `POST {ORCHESTRATION_URL}{ORCHESTRATION_CALLBACK_PATH}` (default path `/v1/callbacks/stage`),
+        `Content-Type: application/json`.
+
+
+        **When.** Once per job of `POST /v1/structuring/jobs`: `stage: STRUCTURING` with `status: DONE`
+        once the fields are stored, or `status: FAILED` with `error_message` when the document has no
+        text (the chain stops there). Additionally `stage: SCORING`, `status: FAILED` when structuring
+        succeeded but the scoring service could not be reached after retries. Without `PIPELINE_OUTBOX`
+        the `STRUCTURING` callback is sent before the hand-off to scoring; with it the hand-off goes first,
+        so the `SCORING` callback may arrive before this one.
+
+
+        **Expected answer.** Any `2xx`; the body is ignored. `5xx`, a timeout or an unreachable host are
+        retried (3 attempts by default, exponential back-off from 0.5 s). A `4xx` is NOT retried. A callback
+        that still fails is logged and dropped: the job itself stays `DONE` / `FAILED`, so the orchestrator
+        can reconcile with the orchestrator SLIP_GAJI''s `GET /v1/extract-ocr/{request_id}` and should
+        time a request out on its own. With `PIPELINE_OUTBOX` the callback is instead queued in the same
+        transaction as the result and retried with back-off (up to 5 minutes apart) for up to `PIPELINE_OUTBOX_MAX_AGE_SECONDS`
+        (24 h by default); a `4xx`, or that age, makes it a dead letter that stays in the table and is
+        counted by `GET .../outbox`.
+
+
+        **What the receiver must tolerate.** The same callback may arrive more than once (treat it as
+        idempotent), and callbacks of different stages come from different services, so they may arrive
+        out of order: only ever move a request''s status forward. Reject callbacks whose `X-API-Key` is
+        wrong.'
+      operationId: stageCallback
+      parameters:
+      - description: '`ORCHESTRATION_API_KEY` of the sending service; when unset, that service''s own
+          `API_KEY`'
+        required: true
+        schema:
+          type: string
+          title: X-Api-Key
+          description: '`ORCHESTRATION_API_KEY` of the sending service; when unset, that service''s own
+            `API_KEY`'
+        name: x-api-key
+        in: header
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StageCallback'
+        required: true
+      responses:
+        '200':
+          description: Acknowledged. Any 2xx is accepted and the body is ignored.
+          content:
+            application/json:
+              schema: {}
+components:
+  schemas:
+    ErrorResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          examples:
+          - 400
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          examples:
+          - Bad Request
+        message:
+          type: string
+          title: Message
+          description: Human-readable cause; safe to log
+          examples:
+          - Uploaded file is empty
+        data:
+          type: 'null'
+          title: Data
+          description: Always null on error
+        errors:
+          type: string
+          title: Errors
+          description: Machine-readable cause. `VALIDATION_ERROR` for 422 (branch on this, the message
+            names a different field every time); for every other status it repeats `message`
+          examples:
+          - Uploaded file is empty
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: Present when the error is tied to a known request_id
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+      type: object
+      required:
+      - status_code
+      - status_desc
+      - message
+      - errors
+      title: ErrorResponse
+      description: Every error response.
+    GuardrailsDocument:
+      properties:
+        verdict:
+          anyOf:
+          - type: string
+            enum:
+            - accepted
+            - reject
+            - skipped
+          - type: 'null'
+          title: Verdict
+          description: Putusan dokumen
+          examples:
+          - accepted
+        confidence:
+          anyOf:
+          - type: number
+            maximum: 1.0
+            minimum: 0.0
+          - type: 'null'
+          title: Confidence
+          description: 'Lolos: P(slip gaji). Ditolak: keyakinan pada penolakan'
+          examples:
+          - 0.9934
+        n_pages:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: N Pages
+          description: Halaman yang dinilai
+          examples:
+          - 3
+        threshold:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Threshold
+          description: Ambang yang dipakai pemeriksaan penentu
+          examples:
+          - 0.47
+        threshold_target:
+          anyOf:
+          - type: string
+            enum:
+            - accept
+            - reject
+          - type: 'null'
+          title: Threshold Target
+          description: Sisi ambang
+      additionalProperties: true
+      type: object
+      title: GuardrailsDocument
+      description: Putusan guardrail untuk dokumen ini (bentuk API spec [07]).
+    GuardrailsPayload:
+      properties:
+        passed:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Passed
+          description: 'true: dokumen boleh lanjut ke structuring'
+          examples:
+          - true
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reason
+          description: Alasan ditahan; null bila lolos
+          examples:
+          - null
+        verdict:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Verdict
+          description: Putusan gabungan
+          examples:
+          - slip_gaji
+        skipped:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Skipped
+          description: Guardrail yang dimatikan (`GUARDRAIL_<NAMA>_ENABLED=false`)
+          examples:
+          - []
+        unavailable:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Unavailable
+          description: Guardrail yang menyala tetapi tidak menjawab (dilewati, fail-open)
+          examples:
+          - []
+        skipped_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Skipped Reason
+          description: Kenapa tidak ada putusan
+        document:
+          anyOf:
+          - $ref: '#/components/schemas/GuardrailsDocument'
+          - type: 'null'
+      additionalProperties: true
+      type: object
+      title: GuardrailsPayload
+      description: Laporan gabungan ketiga guardrail (guardrail-blank, guardrail-blur, guardrail-identity),
+        dihasilkan tahap OCR karena modelnya membaca teks OCR, lalu diteruskan tanpa diubah ke structuring
+        dan scoring.
+    HealthResponse:
+      properties:
+        status:
+          type: string
+          title: Status
+          description: '`healthy` (HTTP 200) or `unhealthy` (HTTP 503)'
+          examples:
+          - healthy
+        version:
+          type: string
+          title: Version
+          description: Service version
+          examples:
+          - 1.0.0
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Detail
+          description: The cause when `unhealthy`; null when healthy
+          examples:
+          - null
+        device:
+          type: string
+          title: Device
+          description: Where this service computes
+          examples:
+          - cpu
+        backends:
+          additionalProperties:
+            type: string
+          type: object
+          title: Backends
+          description: Active implementation per concern (model backend, storage). Useful to confirm a
+            deployment
+          examples:
+          - ekstraksi: paddle
+            storage: postgres
+      type: object
+      required:
+      - status
+      - version
+      - device
+      - backends
+      title: HealthResponse
+      description: '`GET /health`.'
+    JobAccepted:
+      properties:
+        request_id:
+          type: string
+          title: Request Id
+          description: Echo of the submitted request_id
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        stage:
+          type: string
+          enum:
+          - OCR
+          - STRUCTURING
+          - SCORING
+          title: Stage
+          description: Pipeline stage that accepted the job
+          examples:
+          - OCR
+        status:
+          type: string
+          enum:
+          - PROCESSING
+          - DONE
+          - FAILED
+          title: Status
+          description: '`PROCESSING` for a newly accepted job. When `duplicate` is true: the current status
+            of the job that already exists for this request_id'
+          examples:
+          - PROCESSING
+        duplicate:
+          type: boolean
+          title: Duplicate
+          description: 'true: this request_id was already accepted before and the work is NOT run again
+            (idempotent). Exception: a job whose status is `FAILED` is re-claimed and run again, and answers
+            `duplicate: false`'
+          default: false
+          examples:
+          - false
+      type: object
+      required:
+      - request_id
+      - stage
+      - status
+      title: JobAccepted
+      description: '`data` of `POST /v1/<stage>/jobs`.'
+    JobAcceptedResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 202
+          examples:
+          - 202
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: Accepted
+          examples:
+          - Accepted
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Accepted
+          examples:
+          - Accepted
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/JobAccepted'
+      type: object
+      required:
+      - data
+      title: JobAcceptedResponse
+      description: Envelope of `POST /v1/<stage>/jobs`.
+    OcrPageIn:
+      properties:
+        page:
+          type: integer
+          minimum: 1.0
+          title: Page
+          description: Nomor halaman, mulai dari 1
+          default: 1
+          examples:
+          - 1
+        text:
+          type: string
+          title: Text
+          description: Teks OCR halaman ini, urut baca
+          examples:
+          - 'SLIP GAJI
+
+            Gaji Pokok  Rp 4.500.000'
+        confidence:
+          additionalProperties: true
+          type: object
+          title: Confidence
+          description: Ringkasan skor OCR halaman ini; diteruskan ke tahap scoring sebagai fitur mutu
+            OCR
+      type: object
+      required:
+      - text
+      title: OcrPageIn
+    OutboxRelease:
+      properties:
+        stage:
+          type: string
+          enum:
+          - OCR
+          - STRUCTURING
+          - SCORING
+          title: Stage
+          description: The stage whose dead letters were released
+          examples:
+          - OCR
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: Only this request's dead letters were released; null = every dead letter of the
+            stage
+        released:
+          type: integer
+          title: Released
+          description: Dead letters put back in the queue, due immediately
+          examples:
+          - 1
+      type: object
+      required:
+      - stage
+      - released
+      title: OutboxRelease
+      description: The `data` of `POST /v1/<stage>/outbox/release`.
+    OutboxReleaseResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 200
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: OK
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Success
+          examples:
+          - Success
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/OutboxRelease'
+      type: object
+      required:
+      - data
+      title: OutboxReleaseResponse
+      description: Envelope of `POST /v1/<stage>/outbox/release`.
+    OutboxStatus:
+      properties:
+        enabled:
+          type: boolean
+          title: Enabled
+          description: 'false when `PIPELINE_OUTBOX` is off: callbacks are sent directly and nothing is
+            queued'
+        stage:
+          type: string
+          enum:
+          - OCR
+          - STRUCTURING
+          - SCORING
+          title: Stage
+          description: The stage whose messages this service's relay delivers
+          examples:
+          - OCR
+        pending:
+          type: integer
+          title: Pending
+          description: Messages not yet delivered, including the ones a relay is sending right now
+          examples:
+          - 0
+        retrying:
+          type: integer
+          title: Retrying
+          description: 'Of `pending`: messages that already failed at least once'
+          examples:
+          - 0
+        oldest_pending_seconds:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Oldest Pending Seconds
+          description: Age of the oldest pending message; null when nothing is pending. Growing past `PIPELINE_OUTBOX_STALE_AFTER_SECONDS`
+            means the orchestrator or the next stage is not taking messages
+          examples:
+          - null
+        dead_letters:
+          type: integer
+          title: Dead Letters
+          description: Messages given up on (a 4xx from the receiver, or 5xx for longer than `PIPELINE_OUTBOX_MAX_AGE_SECONDS`).
+            They stay in `pipeline_outbox` with `failed_at` and `last_error` for inspection and are never
+            retried; anything above 0 needs a human
+          examples:
+          - 0
+      type: object
+      required:
+      - enabled
+      - stage
+      - pending
+      - retrying
+      - dead_letters
+      title: OutboxStatus
+      description: The `data` of `GET /v1/<stage>/outbox`.
+    OutboxStatusResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 200
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: OK
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Success
+          examples:
+          - Success
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/OutboxStatus'
+      type: object
+      required:
+      - data
+      title: OutboxStatusResponse
+      description: Envelope of `GET /v1/<stage>/outbox`.
+    ReadyResponse:
+      properties:
+        status:
+          type: string
+          enum:
+          - ready
+          - not_ready
+          title: Status
+          description: '`ready` (HTTP 200) when every check is `ok`, else `not_ready` (HTTP 503)'
+          examples:
+          - ready
+        checks:
+          additionalProperties:
+            type: string
+            enum:
+            - ok
+            - failed
+          type: object
+          title: Checks
+          description: One entry per REQUIRED dependency of this service; empty when it has none
+          examples:
+          - database: ok
+      type: object
+      required:
+      - status
+      - checks
+      title: ReadyResponse
+      description: '`GET /ready`.'
+    SlipOut:
+      properties:
+        slip_no:
+          type: integer
+          minimum: 1.0
+          title: Slip No
+          description: Nomor urut slip dalam dokumen ini
+          examples:
+          - 1
+        page:
+          type: integer
+          minimum: 1.0
+          title: Page
+          description: Halaman asal slip ini
+          examples:
+          - 1
+        fields:
+          additionalProperties: true
+          type: object
+          title: Fields
+          description: '20 field, selalu lengkap; null bila tidak ditemukan. Nominal uang sudah integer.
+            Field: `nama_perusahaan`, `periode`, `nama_karyawan`, `nomor_induk_karyawan`, `jabatan`, `divisi`,
+            `status_pegawai`, `gaji_pokok`, `tunjangan_jabatan`, `tunjangan_transport`, `tunjangan_makan`,
+            `tunjangan_komunikasi`, `tunjangan_lain`, `bonus`, `insentif`, `lembur`, `thr`, `total_pendapatan`,
+            `total_potongan`, `gaji_bersih`'
+        source:
+          additionalProperties: true
+          type: object
+          title: Source
+          description: 'Asal tiap nilai: `how` (regex | llm | derived), sinonim label yang cocok, dan
+            baris OCR-nya'
+        checks:
+          additionalProperties: true
+          type: object
+          title: Checks
+          description: Hasil cek aritmetika slip
+        counts:
+          additionalProperties: true
+          type: object
+          title: Counts
+          description: Berapa field terisi, dan dari lapisan mana
+        llm:
+          additionalProperties: true
+          type: object
+          title: Llm
+          description: Jejak arbitrase LLM; `compare` dibaca model keyakinan
+        missing_mandatory_fields:
+          items:
+            type: string
+          type: array
+          title: Missing Mandatory Fields
+          description: Field wajib yang tidak terisi pada slip ini
+      type: object
+      required:
+      - slip_no
+      - page
+      - fields
+      title: SlipOut
+    StageCallback:
+      properties:
+        request_id:
+          type: string
+          title: Request Id
+          description: request_id yang Anda kirim lewat `POST /v1/ekstraksi/jobs`
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        stage:
+          type: string
+          enum:
+          - OCR
+          - STRUCTURING
+          - SCORING
+          title: Stage
+          description: 'Tahap yang statusnya dilaporkan. Biasanya tahap pengirim sendiri; ketika penyerahan
+            ke tahap BERIKUTNYA gagal setelah beberapa percobaan, pengirim melaporkan `status: FAILED`
+            dengan nama tahap berikutnya, karena tahap itu tidak pernah menerima jobnya dan tidak bisa
+            melapor sendiri'
+          examples:
+          - OCR
+        status:
+          type: string
+          enum:
+          - DONE
+          - FAILED
+          title: Status
+          description: Hasil tahap ini. `FAILED` di tahap mana pun mengakhiri permintaan
+          examples:
+          - DONE
+        result:
+          type: 'null'
+          title: Result
+          description: Selalu null untuk OCR dan STRUCTURING; baca hasilnya lewat GET .../jobs/{request_id}
+        error_message:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error Message
+          description: Kenapa gagal; null bila `status` `DONE`
+          examples:
+          - null
+        error_code:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error Code
+          description: 'Hanya saat penolakan: `DOWNSTREAM_VALIDATION_ERROR` ketika dokumen ditahan guardrail
+            (`error_message` memuat alasannya). Tidak ada ketika sebuah tahap rusak'
+          examples:
+          - null
+      type: object
+      required:
+      - request_id
+      - stage
+      - status
+      title: StageCallback
+      description: Isi callback yang dikirim sebuah tahap ke orchestrator saat selesai.
+    StructureRequest:
+      properties:
+        pages:
+          items:
+            $ref: '#/components/schemas/OcrPageIn'
+          type: array
+          minItems: 1
+          title: Pages
+          description: 'Halaman hasil OCR. **Satu halaman = satu slip**: berkas tiga bulan menghasilkan
+            tiga slip. Jangan menggabungkan teks halaman — komponen satu bulan akan tercampur ke total
+            bulan lain'
+      type: object
+      required:
+      - pages
+      title: StructureRequest
+    StructureResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 200
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: OK
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Success
+          examples:
+          - Success
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/StructuringResult'
+      type: object
+      required:
+      - data
+      title: StructureResponse
+    StructuringJobRequest:
+      properties:
+        request_id:
+          type: string
+          title: Request Id
+          description: request_id dari orchestrator
+          examples:
+          - OCR_9cb01af2-493d-446d-b191-af120333f6d0
+        document_type:
+          type: string
+          title: Document Type
+          default: slip_gaji
+          examples:
+          - slip_gaji
+        guardrails:
+          anyOf:
+          - $ref: '#/components/schemas/GuardrailsPayload'
+          - type: 'null'
+          description: Laporan guardrail dari tahap OCR; diteruskan apa adanya sampai hasil akhir
+        ocr:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Ocr
+          description: 'Hasil tahap OCR (`pages[]`, `full_text`). Boleh dihilangkan bila `PIPELINE_HANDOFF_BY_REFERENCE`
+            menyala: service ini membacanya dari `ocr_results` memakai request_id'
+        pipeline_name_sequence:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Pipeline Name Sequence
+          description: Urutan service permintaan ini; null = pipeline penuh. Bila `structuring` terakhir,
+            job ini mengakhiri permintaan dan tidak diteruskan ke scoring
+          examples:
+          - null
+        column_confidence_threshold:
+          anyOf:
+          - additionalProperties:
+              type: number
+            type: object
+          - type: 'null'
+          title: Column Confidence Threshold
+          description: Ambang per field (0-1) dari permintaan; diteruskan ke scoring
+          examples:
+          - null
+      type: object
+      required:
+      - request_id
+      title: StructuringJobRequest
+    StructuringJobStatus:
+      properties:
+        request_id:
+          type: string
+          title: Request Id
+          description: request_id of the pipeline run
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        stage:
+          type: string
+          const: STRUCTURING
+          title: Stage
+          default: STRUCTURING
+          examples:
+          - STRUCTURING
+        status:
+          type: string
+          enum:
+          - PROCESSING
+          - DONE
+          - FAILED
+          title: Status
+          description: '`PROCESSING` -> `DONE` | `FAILED`. A `FAILED` job may go back to `PROCESSING`
+            when resubmitted'
+          examples:
+          - DONE
+        error_message:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error Message
+          description: Why the stage failed; null unless `status` is `FAILED`. Same text as the FAILED
+            callback
+          examples:
+          - null
+        created_at:
+          type: string
+          title: Created At
+          description: When the job was first accepted (ISO 8601, UTC)
+          examples:
+          - '2026-09-18T04:00:00+00:00'
+        updated_at:
+          type: string
+          title: Updated At
+          description: Last status change (ISO 8601, UTC)
+          examples:
+          - '2026-09-18T04:00:01+00:00'
+        pipeline_name_sequence:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Pipeline Name Sequence
+          description: 'The request''s pipeline_name_sequence (null: the full pipeline). The orchestrator
+            reads it from the OCR job to answer `GET /v1/extract-ocr/{request_id}` up to the same last
+            service as the POST'
+          examples:
+          - null
+        column_confidence_threshold:
+          anyOf:
+          - additionalProperties:
+              type: number
+            type: object
+          - type: 'null'
+          title: Column Confidence Threshold
+          description: The request's per-field thresholds (0-1); null when not sent
+          examples:
+          - null
+        result:
+          anyOf:
+          - $ref: '#/components/schemas/StructuringResult'
+          - type: 'null'
+          description: Hasil structuring setelah `status` menjadi `DONE`
+      type: object
+      required:
+      - request_id
+      - status
+      - created_at
+      - updated_at
+      title: StructuringJobStatus
+    StructuringJobStatusResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 200
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: OK
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Human-readable outcome
+          default: Success
+          examples:
+          - Success
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/StructuringJobStatus'
+      type: object
+      required:
+      - data
+      title: StructuringJobStatusResponse
+    StructuringResult:
+      properties:
+        document_type:
+          type: string
+          title: Document Type
+          examples:
+          - slip_gaji
+        n_slips:
+          type: integer
+          minimum: 0.0
+          title: N Slips
+          description: Jumlah slip yang ditemukan di dokumen ini
+          examples:
+          - 3
+        slips:
+          items:
+            $ref: '#/components/schemas/SlipOut'
+          type: array
+          title: Slips
+          description: Satu entri per slip, urut halaman
+        llm_used:
+          type: boolean
+          title: Llm Used
+          description: true bila arbitrase LLM benar-benar dipanggil
+          default: false
+        elapsed_ms:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Elapsed Ms
+          description: Waktu structuring, milidetik
+          examples:
+          - 227.5
+        reject_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reject Reason
+          description: Terisi bila aturan structuring menolak dokumen; pipeline berhenti dan klien menerima
+            400
+      type: object
+      required:
+      - document_type
+      - n_slips
+      - slips
+      title: StructuringResult
+  securitySchemes:
+    APIKeyHeader:
+      type: apiKey
+      description: API key for this service
+      in: header
+      name: X-API-Key
+tags:
+- name: Pipeline
+  description: 'Tahap pipeline asinkron: 202, kerja di latar, callback, penyerahan'
+- name: Callbacks
+  description: Permintaan yang DIKIRIM service ini ke orchestrator (lihat Webhooks)
+- name: Structuring
+  description: Teks OCR -> 20 field slip gaji, sinkron
+- name: Health
+  description: Health and readiness checks; no API key

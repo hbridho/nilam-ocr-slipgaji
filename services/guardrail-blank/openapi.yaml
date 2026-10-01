@@ -1,0 +1,566 @@
+openapi: 3.1.0
+info:
+  title: OCR Slip Gaji Guardrail Blank API
+  description: 'Guardrail 1 dari 3 pipeline OCR Slip Gaji, internal: **apakah halaman ini kosong?**
+
+
+    Ketiga guardrail berdiri sebagai service sendiri dan dipanggil orchestrator PARALEL setelah tahap
+    OCR: `guardrail-blank` (:8035), `guardrail-blur` (:8036), `guardrail-identity` (:8037). Masing-masing
+    menjawab satu pertanyaan dan tidak tahu jawaban dua yang lain; yang menggabungkan ketiganya menjadi
+    satu putusan dokumen adalah orchestrator, dengan urutan kosong > buram > identitas.
+
+
+    Pemeriksaan ini aturan satu baris atas panjang teks — tanpa model, tanpa bobot, tanpa ambang yang
+    bisa bergeser bersama korpus. Halaman tanpa teks tidak punya mutu maupun identitas yang bisa dinilai,
+    jadi jawabannya harus datang lebih dulu dan tidak boleh bergantung pada apa pun yang dipelajari.
+
+
+    Semua endpoint kecuali /health, /ready dan /metrics memerlukan header X-API-Key.
+
+
+    ## Conventions (the same for every nilam-ocr service)
+
+
+    **Authentication.** Every endpoint except `/health`, `/ready` and `/metrics` requires the header `X-API-Key`.
+
+    A missing or wrong key answers `401`. The services are reachable only from inside the cluster.
+
+
+    **Envelope.** Every JSON response, success or error, has the same shape:
+
+    `{status_code, status_desc, message, data, errors, request_id}`. `status_code` always equals the HTTP
+
+    status. On success `errors` is null; on error `data` is null.
+
+
+    **Errors.** `errors` is a stable, machine-readable code; branch on it, not on the wording of `message`.
+
+    The document checks: `EMPTY_FILE`, `UNSUPPORTED_FILE_TYPE`, `UNREADABLE_FILE`, `TOO_MANY_PAGES`,
+
+    `INVALID_FILE_SOURCE`, `FILE_URL_REJECTED` (400), `FILE_TOO_LARGE` (413). Otherwise the code of the
+    status:
+
+    `UNAUTHORIZED` (401), `REQUEST_ID_NOT_FOUND` (404, an unknown request_id), `NOT_FOUND` (404, a path
+    that does
+
+    not exist), `METHOD_NOT_ALLOWED` (405), `VALIDATION_ERROR` (422), `INTERNAL_SERVER_ERROR` (500),
+
+    `DOWNSTREAM_UNAVAILABLE` (503), `DOWNSTREAM_TIMEOUT` (504), unless an endpoint documents a more precise
+    one.
+
+    `400` = the request or the document is unusable (do not retry unchanged). `503` / `504` are safe to
+    retry.
+
+
+    **request_id.** Minted by the central orchestrator and carried through every stage. Where an endpoint
+    has
+
+    no request_id of its own, the `X-Request-ID` request header is used (and echoed in the response header);
+
+    without it the service generates one.
+
+
+    **Asynchronous stages** (internal: only the orchestrator SLIP_GAJI and the previous stage call them).
+    `POST
+
+    .../jobs` answers `202` immediately and does the work in the background. The outcome is reported by
+    a
+
+    callback to the central orchestrator (see *Webhooks*), and can be read at any time with
+
+    `GET .../jobs/{request_id}`, which the orchestrator SLIP_GAJI''s `GET /v1/extract-ocr/{request_id}`
+    combines
+
+    over the three stages. Submitting the same request_id again is idempotent:
+
+    `202` with `duplicate: true`, the work is not repeated, unless the earlier attempt `FAILED` or has
+    been
+
+    `PROCESSING` for longer than the job lease (`PIPELINE_JOB_LEASE_SECONDS`, 5 minutes by default: the
+
+    process running it died). A job still running when the service shuts down is reported `FAILED`. Because
+
+    the request was already answered `202`, a problem with the document itself (unreadable file, no text,
+
+    unsupported document type) shows up as a `FAILED` job and callback, not as a `4xx`.
+
+    '
+  version: 1.0.0
+servers:
+- url: /
+  description: This host (where this page is served)
+- url: http://ms-bribrain-nilam-ocr-slipgaji-guardrail-blank.{namespace}.svc.cluster.local:8035
+  description: GKE, from inside the release's namespace (the other services of this pipeline)
+  variables:
+    namespace:
+      default: ms-bribrain-nilam-ocr-slipgaji
+      description: 'Namespace of the Helm release (deploy/helm/deploy.sh: nilam-ocr-slipgaji)'
+- url: http://guardrail-blank:8035
+  description: The Docker Compose network
+- url: http://127.0.0.1:8035
+  description: Local development
+paths:
+  /health:
+    get:
+      tags:
+      - Health
+      summary: Health check, including the database
+      description: 'Says whether the service can reach what it depends on: 200 `healthy` when every dependency
+        it checks answers (the database, for a service that has one), 503 `unhealthy` with the cause in
+        `detail` otherwise. Each check gives up after 3 s. Also lists the active implementations (`backends`).
+        Not used by the Kubernetes probes: liveness and startup check the port, readiness is `/ready`.
+        Does not require an API key.'
+      operationId: getHealth
+      responses:
+        '200':
+          description: Every dependency answers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                healthy:
+                  summary: Healthy
+                  value:
+                    status: healthy
+                    version: 1.0.0
+                    device: cpu
+                    backends:
+                      blank: slip_blank
+        '503':
+          description: A dependency does not answer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: unhealthy
+                version: 1.0.0
+                detail: database unreachable
+                device: cpu
+                backends:
+                  blank: slip_blank
+  /ready:
+    get:
+      tags:
+      - Health
+      summary: Readiness probe
+      description: 'The readiness probe. Liveness is checked on the port, never on a dependency (a database
+        blip must not make Kubernetes restart every pod). /ready says whether this pod can do its job
+        right now: 200 when every REQUIRED dependency of this service answers, 503 otherwise, so the pod
+        is taken out of the Service until it recovers. Downstream stages and model services are deliberately
+        not checked: their outage is reported per job, not by refusing traffic. Does not require an API
+        key.'
+      operationId: getReadiness
+      responses:
+        '200':
+          description: Every required dependency answers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              examples:
+                ready:
+                  summary: Ready
+                  value:
+                    status: ready
+                    checks: {}
+        '503':
+          description: A required dependency is unavailable; the pod is taken out of the Service
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              example:
+                status: not_ready
+                checks: {}
+  /metrics:
+    get:
+      tags:
+      - Health
+      summary: Prometheus metrics
+      description: 'Prometheus text exposition of this process: `http_requests_total` and `http_request_duration_seconds`
+        per route template, and for the pipeline stages `pipeline_jobs_total` (by outcome), `pipeline_job_duration_seconds`,
+        `pipeline_stale_jobs_reclaimed_total`, `pipeline_outbox_deliveries_total` and the outbox backlog
+        gauges (`pipeline_outbox_pending`, `_retrying`, `_dead_letters`, `_oldest_pending_seconds`). Scraped
+        inside the cluster; does not require an API key.'
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Metrics in the Prometheus text format
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/guardrail/blank/check:
+    post:
+      tags:
+      - Guardrail
+      summary: 'Guardrail 1 · Halaman ini kosong? (internal: dipanggil orchestrator, paralel)'
+      description: 'Menilai panjang teks OCR seluruh halaman dan menjawab satu hal saja, **tanpa** memulai
+        apa pun: tidak ada job, tidak ada callback.
+
+
+        **Satu pemeriksaan dari tiga, dan yang paling dangkal dengan sengaja.** Ia hanya menghitung panjang
+        teks OCR: `chars <= max_chars` berarti kosong. Tidak ada bobot, tidak ada model, tidak ada ambang
+        yang bisa bergeser.
+
+
+        **Kenapa aturan, bukan model.** Tidak ada yang perlu ditaksir di sini, dan model yang dilatih
+        atas halaman kosong buatan akan terlihat sempurna di validasi sambil salah pada halaman kosong
+        yang bentuknya lain.
+
+
+        **Kenapa ia yang pertama dalam urutan putusan.** Tanpa teks tidak ada mutu maupun identitas yang
+        bisa dinilai. Karena ketiga guardrail dipanggil PARALEL, dua pemeriksaan lain tetap menjawab pada
+        halaman kosong — dan jawaban mereka di situ tidak berarti apa-apa. Yang mendahulukan `blank` adalah
+        orchestrator saat menggabungkan ketiganya (`slip_ml.guard.combine`), bukan service ini.
+
+
+        Selalu 200 ketika permintaannya sah — baca `data.verdict` dan `data.passed`. Teks kosong juga
+        200, dengan `verdict: blank`: itu jawaban, bukan galat.'
+      operationId: checkBlank
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TextCheckRequest'
+        required: true
+      responses:
+        '200':
+          description: Halaman dinilai
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BlankReportResponse'
+              examples:
+                ok:
+                  summary: Ada teks
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: OK
+                    data:
+                      check: blank
+                      verdict: ok
+                      passed: true
+                      chars: 1789
+                      max_chars: 20
+                      model: slip_blank
+                    request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+                blank:
+                  summary: Kosong
+                  value:
+                    status_code: 200
+                    status_desc: OK
+                    message: OK
+                    data:
+                      check: blank
+                      verdict: blank
+                      passed: false
+                      reason: 'Dokumen kosong: tidak ada teks yang terbaca. Pastikan halaman yang diunggah
+                        benar.'
+                      chars: 0
+                      max_chars: 20
+                      model: slip_blank
+                    request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
+        '401':
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 401
+                status_desc: Unauthorized
+                message: Invalid or missing API key
+                errors: Invalid or missing API key
+                pipeline_last_stage: guardrail-blank
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 422
+                status_desc: Unprocessable Entity
+                message: 'body.text: Field required'
+                errors: VALIDATION_ERROR
+                pipeline_last_stage: guardrail-blank
+      security:
+      - APIKeyHeader: []
+components:
+  schemas:
+    BlankReport:
+      properties:
+        check:
+          type: string
+          const: blank
+          title: Check
+          description: Pemeriksaan yang menjawab
+          default: blank
+        verdict:
+          type: string
+          enum:
+          - blank
+          - ok
+          title: Verdict
+          description: '`blank` halaman tanpa teks · `ok` ada teks yang bisa dinilai'
+          examples:
+          - ok
+        passed:
+          type: boolean
+          title: Passed
+          description: true ketika halaman TIDAK kosong
+          examples:
+          - true
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reason
+          description: Alasan berbahasa Indonesia yang bisa ditampilkan apa adanya; null bila lolos
+        chars:
+          type: integer
+          minimum: 0.0
+          title: Chars
+          description: Jumlah karakter teks OCR setelah dipangkas
+          examples:
+          - 1789
+        max_chars:
+          type: integer
+          minimum: 0.0
+          title: Max Chars
+          description: 'Batas yang dipakai: `chars <= max_chars` berarti kosong'
+          examples:
+          - 20
+        model:
+          type: string
+          title: Model
+          description: Backend yang menjawab
+          examples:
+          - slip_blank
+      type: object
+      required:
+      - verdict
+      - passed
+      - chars
+      - max_chars
+      - model
+      title: BlankReport
+    BlankReportResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          default: 200
+          examples:
+          - 200
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          default: OK
+          examples:
+          - OK
+        message:
+          type: string
+          title: Message
+          description: Ringkasan hasil
+          default: OK
+          examples:
+          - OK
+        errors:
+          type: 'null'
+          title: Errors
+          description: Always null on success
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: 'The request_id this response belongs to: the one sent in the form / body / path,
+            otherwise the `X-Request-ID` header, otherwise one generated by the service'
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+        data:
+          $ref: '#/components/schemas/BlankReport'
+      type: object
+      required:
+      - data
+      title: BlankReportResponse
+    ErrorResponse:
+      properties:
+        status_code:
+          type: integer
+          title: Status Code
+          description: Same as the HTTP status code
+          examples:
+          - 400
+        status_desc:
+          type: string
+          title: Status Desc
+          description: Reason phrase of `status_code`
+          examples:
+          - Bad Request
+        message:
+          type: string
+          title: Message
+          description: Human-readable cause; safe to log
+          examples:
+          - Uploaded file is empty
+        data:
+          type: 'null'
+          title: Data
+          description: Always null on error
+        errors:
+          type: string
+          title: Errors
+          description: Machine-readable cause. `VALIDATION_ERROR` for 422 (branch on this, the message
+            names a different field every time); for every other status it repeats `message`
+          examples:
+          - Uploaded file is empty
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: Present when the error is tied to a known request_id
+          examples:
+          - REQ_9cb01af2-493d-446d-b191-af120333f6d0
+      type: object
+      required:
+      - status_code
+      - status_desc
+      - message
+      - errors
+      title: ErrorResponse
+      description: Every error response.
+    HealthResponse:
+      properties:
+        status:
+          type: string
+          title: Status
+          description: '`healthy` (HTTP 200) or `unhealthy` (HTTP 503)'
+          examples:
+          - healthy
+        version:
+          type: string
+          title: Version
+          description: Service version
+          examples:
+          - 1.0.0
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Detail
+          description: The cause when `unhealthy`; null when healthy
+          examples:
+          - null
+        device:
+          type: string
+          title: Device
+          description: Where this service computes
+          examples:
+          - cpu
+        backends:
+          additionalProperties:
+            type: string
+          type: object
+          title: Backends
+          description: Active implementation per concern (model backend, storage). Useful to confirm a
+            deployment
+          examples:
+          - ekstraksi: paddle
+            storage: postgres
+      type: object
+      required:
+      - status
+      - version
+      - device
+      - backends
+      title: HealthResponse
+      description: '`GET /health`.'
+    ReadyResponse:
+      properties:
+        status:
+          type: string
+          enum:
+          - ready
+          - not_ready
+          title: Status
+          description: '`ready` (HTTP 200) when every check is `ok`, else `not_ready` (HTTP 503)'
+          examples:
+          - ready
+        checks:
+          additionalProperties:
+            type: string
+            enum:
+            - ok
+            - failed
+          type: object
+          title: Checks
+          description: One entry per REQUIRED dependency of this service; empty when it has none
+          examples:
+          - database: ok
+      type: object
+      required:
+      - status
+      - checks
+      title: ReadyResponse
+      description: '`GET /ready`.'
+    TextCheckRequest:
+      properties:
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: Diulang di respons; opsional
+          examples:
+          - OCR_9cb01af2-493d-446d-b191-af120333f6d0
+        text:
+          type: string
+          title: Text
+          description: Teks OCR seluruh halaman dokumen, digabung dengan baris baru. Boleh kosong — itu
+            bukan galat, melainkan jawaban `blank`
+          examples:
+          - 'SLIP GAJI
+
+            OKTOBER 2023
+
+            Nama  : RATNA SUSANTI
+
+            Gaji Pokok  Rp 2.400.000'
+        confidence:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Confidence
+          description: 'Ringkasan skor OCR halaman. Diterima supaya ketiga guardrail bisa dipanggil dengan
+            badan permintaan yang sama, tetapi **tidak dibaca di sini**: yang diputuskan pemeriksaan ini
+            hanya panjang teks'
+          examples:
+          - mean: 0.9812
+            min: 0.4123
+            n_boxes: 84
+            n_low: 4
+      type: object
+      required:
+      - text
+      title: TextCheckRequest
+  securitySchemes:
+    APIKeyHeader:
+      type: apiKey
+      description: API key for this service
+      in: header
+      name: X-API-Key
+tags:
+- name: Guardrail
+  description: 'Pemeriksaan kosong (internal: dipanggil orchestrator)'
+- name: Health
+  description: Health and readiness checks; no API key
