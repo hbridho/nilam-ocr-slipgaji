@@ -1,0 +1,34 @@
+[project]
+name = "slip-ml"
+version = "1.0.0"
+description = "Pipeline OCR slip gaji dan model guardrail/keyakinan, dipakai bersama oleh service nilam-ocr-slip-gaji"
+# 3.11, bukan 3.12: image semua service memakai python:3.11-slim dan lock-nya dikompilasi untuk 3.11
+# (lihat Makefile). Dengan ">=3.12" pip menolak memasang paket ini di dalam image. Tidak ada sintaks
+# khusus 3.12 di sini — sudah diperiksa untuk PEP 695 dan stdlib 3.12.
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "PyYAML>=6.0",
+  "PyMuPDF>=1.24",
+  "Pillow>=10.0",
+  # Dipakai core/ocr_api untuk memanggil layanan OCR (backend `api`, jalur bawaan).
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+# Mesin OCR lokal — hanya untuk laptop tanpa akses ke layanan OCR. Menambah ratusan MB pada image.
+ocr = ["rapidocr-onnxruntime>=1.3", "onnxruntime>=1.17"]
+# Guardrail piksel — hanya dipakai kalau teks OCR belum ada.
+pixel = ["opencv-python-headless>=4.9", "pypdfium2>=4.30"]
+# Arbitrase nilai uang lewat Amazon Bedrock (ENABLE_LLM=true).
+llm = ["boto3>=1.34"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["slip_ml*"]
+
+[tool.setuptools.package-data]
+slip_ml = ["vendor/slip_gaji_main/*.yaml", "vendor/slip_gaji_main/prompts/*.md", "vendor/ml/models/*.json"]

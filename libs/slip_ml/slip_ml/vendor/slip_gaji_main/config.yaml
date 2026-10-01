@@ -1,0 +1,119 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Every tunable setting for the OCR pipeline lives here — edit values in THIS
+#  file, not in the .py files. Loaded by core/config.py; s1_ocr.py and
+#  s2_structure.py read it once at import.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ocr:                            # s1_ocr.py
+  backend: rapidocr             # where OCR text comes from:  rapidocr (local) | api (HTTP service)
+  render_dpi: 200               # PDF page -> image resolution before OCR
+
+  # backend: rapidocr — extra keyword arguments passed straight to RapidOCR(**rapidocr).
+  # {} keeps the defaults. Examples:  {use_cuda: true}
+  #   {det_model_path: /path/to/det.onnx, rec_model_path: /path/to/rec.onnx}
+  rapidocr: {}
+
+  # backend: api — the paddle6 OCR API (PP-OCRv6 / PP-StructureV3). POST one page image
+  # to /ocr; the reply's pages[].texts[] boxes are rebuilt into reading order by s1_ocr,
+  # the same as the RapidOCR path. Needs network line-of-sight to the 10.x host.
+  api:
+    url: http://10.213.191.199:8080
+    #url : http://10.213.191.198:8080
+    endpoint: /ocr              # POST path — multipart file=<image>, returns {pages:[{texts:[...]}]}
+    upload_field: file          # name of the multipart file field
+    timeout: 120                # seconds
+
+llm:                            # s2_structure.py
+  # SIAPA yang menjawab, dan DI MANA ia berada. Backend dipilih di sini, bukan di dalam kode:
+  #
+  #   bedrock  federasi Entra ID -> STS -> Bedrock (bawaan). Alamatnya bisa ditimpa di bawah,
+  #            jadi "Bedrock di host lain" tidak butuh backend baru.
+  #   http     titik akhir chat-completions ala OpenAI di host mana pun — vLLM, TGI, LiteLLM,
+  #            gateway internal. Isi `endpoint`, dan `api_key_env` kalau perlu kunci.
+  #   off      menolak memanggil; untuk lingkungan yang tidak boleh menembak ke luar.
+  #
+  # Backend lain didaftarkan tanpa menyunting kode inti:
+  #   from core import llm; llm.register_chat_backend("nama", lambda cfg: KlienSaya(cfg))
+  backend: bedrock
+  # Dipakai backend `http`. URL lengkap, termasuk jalurnya.
+  endpoint: null
+  # Nama VARIABEL LINGKUNGAN yang memuat kuncinya — bukan kuncinya sendiri: berkas ini masuk repo.
+  api_key_env: null
+  timeout_seconds: 120
+  # Menimpa alamat backend `bedrock`. Kosong = pakai alamat AWS biasa. Berguna untuk gateway
+  # internal, VPC endpoint, atau cloud berdaulat.
+  region: null
+  entra_token_url: null
+  mantle_url: null
+
+  # Any Bedrock model id available in the account's region (ap-southeast-3). Examples:
+  #   openai.gpt-oss-120b-1:0   openai.gpt-oss-20b-1:0
+  #   anthropic.claude-sonnet-5  anthropic.claude-haiku-4-5-20251001-v1:0
+  #   amazon.nova-pro-v1:0  amazon.nova-lite-v1:0
+  #   qwen.qwen3-235b-a22b-2507-v1:0  deepseek.v3.2
+  model: openai.gpt-oss-120b-1:0
+  temperature: 0.0
+  # Answer budget, shared with the model's reasoning. `null` sends no cap at all — the key
+  # is left out of the request and the model stops when it is done. That is what this
+  # pipeline wants: with all_fields on the model writes 20 keys AND reasons about each, and
+  # at 3000 fifteen of 141 eval pages were being cut off mid-JSON and paying for a retry.
+  # Put a number here to cap it again.
+  max_tokens: null
+  retry_tokens: null            # budget for the one retry after an unreadable reply
+  min_ocr_chars: 40             # fewer OCR characters than this on a page -> skip the call
+  # How much OCR text goes into the prompt, in CHARACTERS (not tokens). Only 3 of 1,516
+  # pages in this corpus exceed 6,000 — but those are the densest pages, which are exactly
+  # the ones a silent truncation hurts most.
+  ocr_char_limit: 25000
+
+  # Ask the model for all 20 fields instead of only the ones the rules could not find.
+  # This is what gives "arbitrates" below anything to arbitrate — with it off the model is
+  # never asked about a field a rule already filled. It costs one LLM call on EVERY page,
+  # including pages that used to be answered by the rules alone and cost nothing.
+  # Worth 87.8% -> 89.5% on the eval pile. Set to false to go back to gap-filling only.
+  all_fields: true
+
+  # Who wins when the rules and the model disagree about a field they BOTH answered.
+  # Only takes effect with "LLM semua field" on (llm_all), because otherwise the model is
+  # never asked about a field the rules already filled.
+  #
+  # Measured over the 50-document eval pile: rules always winning 87.8%, model always
+  # winning 89.4%, and the split below 89.5%. The model reads amounts out of two-column
+  # tables better; the rules read identity values better and can name the line they used.
+  # Set to [] to go back to "a rule answer is never overruled".
+  # Every money field, including the two the rules happened to win 1-0 here: a 1-0 result
+  # over 50 documents is not evidence, and carving them out would be fitting the list to
+  # this sample rather than to the reason.
+  arbitrates:
+    - gaji_pokok
+    - tunjangan_jabatan
+    - tunjangan_transport
+    - tunjangan_makan
+    - tunjangan_komunikasi
+    - tunjangan_lain
+    - bonus
+    - insentif
+    - lembur
+    - thr
+    - total_pendapatan
+    - total_potongan
+    - gaji_bersih
+
+# Dari mana prompt dibaca. Teksnya sengaja TIDAK di berkas ini supaya bisa pindah ke basis
+# data tanpa menyentuh pipeline: yang berubah cukup `source`.
+#
+#   source   file | db
+#   name     kunci prompt — di basis data inilah yang dicari
+#   version  dinaikkan setiap teksnya berubah; ikut tercatat bersama hasil ekstraksi
+#   path     dipakai saat source: file, relatif terhadap berkas ini
+#
+# Placeholder disubstitusi dengan str.replace biasa (BUKAN str.format), jadi tanda { } di dalam
+# prompt aman:
+#   {n}      banyaknya field yang diminta
+#   {fields} namanya, satu per baris, berawalan "- "
+#   {text}   teks OCR (sebanyak ocr_char_limit karakter pertama)
+prompt:
+  source: file
+  name: slip_gaji
+  version: 1
+  path: prompts/slip_gaji.v1.md
