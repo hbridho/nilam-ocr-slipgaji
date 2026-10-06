@@ -15,9 +15,27 @@ from app.ml.mock import MockIdentityCheck
 from app.ml.slip_identity import build_identity_check
 
 # IDENTITY_BACKEND -> cara membangunnya. Tambahkan backend di sini dan, kalau butuh setelan, di config.py.
+
+
+def _with_model(settings, build):
+    """Point slip_ml at the model file (guard_text.json: baked in the image, or downloaded from
+    IDENTITY_MODEL_GCS_URI at start), then build the backend."""
+    from ocr_common.clients.models import model_file
+
+    from slip_ml import models
+
+    models.use(
+        models.IDENTITY,
+        model_file(
+            models.baked(models.IDENTITY), settings.identity_model_gcs_uri, settings.identity_model_sha256, settings
+        ),
+    )
+    return build()
+
+
 BACKENDS: dict[str, Factory[IdentityCheck]] = {
     "mock": lambda settings: MockIdentityCheck(),
-    "slip_identity": lambda settings: build_identity_check(),
+    "slip_identity": lambda settings: _with_model(settings, build_identity_check),
 }
 
 
@@ -49,7 +67,7 @@ def get_reject_threshold() -> RejectThreshold:
     return RejectThreshold(
         client,
         settings.identity_threshold_path,
-        default_threshold(settings.identity_reject_threshold, get_identity_check()),
+        default_threshold(settings.identity_threshold, get_identity_check()),
         cache_seconds=settings.identity_threshold_cache_seconds,
     )
 

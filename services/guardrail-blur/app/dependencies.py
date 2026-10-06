@@ -13,9 +13,25 @@ from app.ml.mock import MockBlurCheck
 from app.ml.slip_blur import build_blur_check
 
 # BLUR_BACKEND -> cara membangunnya. Tambahkan backend di sini dan, kalau butuh setelan, di config.py.
+
+
+def _with_model(settings, build):
+    """Point slip_ml at the model file (guard_quality.json: baked in the image, or downloaded from
+    BLUR_MODEL_GCS_URI at start), then build the backend."""
+    from ocr_common.clients.models import model_file
+
+    from slip_ml import models
+
+    models.use(
+        models.QUALITY,
+        model_file(models.baked(models.QUALITY), settings.blur_model_gcs_uri, settings.blur_model_sha256, settings),
+    )
+    return build()
+
+
 BACKENDS: dict[str, Factory[BlurCheck]] = {
     "mock": lambda settings: MockBlurCheck(),
-    "slip_blur": lambda settings: build_blur_check(),
+    "slip_blur": lambda settings: _with_model(settings, build_blur_check),
 }
 
 

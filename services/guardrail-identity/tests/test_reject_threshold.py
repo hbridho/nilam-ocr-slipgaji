@@ -80,12 +80,20 @@ def test_default_is_the_configured_threshold_else_the_checkpoints():
         {"reject_threshold": 1},
         {"reject_threshold": 1.5},
         {"reject_threshold": float("nan")},
+        {"threshold": 0},
+        {"threshold": "0.5"},
+        {"threshold": None, "reject_threshold": 0.5},
         [0.5],
     ],
 )
 def test_parse_refuses_anything_but_a_threshold_between_0_and_1(body):
     with pytest.raises(ValueError):
         parse_threshold(body)
+
+
+@pytest.mark.parametrize("body", [{"threshold": 0.6}, {"reject_threshold": 0.6}])
+def test_parse_reads_the_npwp_key_and_the_old_one(body):
+    assert parse_threshold(body) == 0.6
 
 
 async def test_without_url_the_default_is_used_and_nothing_is_called():

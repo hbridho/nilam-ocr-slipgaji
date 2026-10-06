@@ -2,8 +2,9 @@
 service ini membacanya dari endpoint orchestrator dan jatuh ke defaultnya sendiri bila gagal.
 
 Arti ambangnya BERBEDA dari guardrail berbasis gambar: di sini skor model adalah P(slip gaji), dan
-dokumen lolos ketika skornya >= ambang. Kuncinya tetap `reject_threshold` agar endpoint orchestrator
-tidak perlu berubah, tetapi yang dibandingkan adalah peluang LOLOS, bukan peluang ditolak.
+dokumen lolos ketika skornya >= ambang (sisi accept, sama dengan nilam-ocr-npwp). Endpoint orchestrator
+menjawab `{"threshold": 0.6}`, seperti NPWP; kunci lama `{"reject_threshold": 0.6}` masih diterima dengan arti
+yang sama (yang dibandingkan selalu peluang LOLOS).
 
 Dari ketiga guardrail hanya pemeriksaan ini yang punya ambang dari luar. Batas `blank` adalah
 panjang teks, bukan skor; dan skala gerbang mutu (P(halaman rusak)) berlawanan arah dengan skala di
@@ -26,21 +27,23 @@ DEFAULT_REJECT_THRESHOLD = 0.5
 
 
 def default_threshold(configured: float | None, classifier: Any) -> float:
-    """Ambang yang dipakai ketika orchestrator tidak memberi: IDENTITY_REJECT_THRESHOLD kalau
-    disetel, kalau tidak ambang yang tersimpan di checkpoint model, kalau tidak 0,5."""
+    """Ambang yang dipakai ketika orchestrator tidak memberi: IDENTITY_THRESHOLD kalau disetel, kalau
+    tidak ambang yang tersimpan di checkpoint model, kalau tidak 0,5."""
     if configured is not None:
         return configured
     return float(getattr(classifier, "reject_threshold", DEFAULT_REJECT_THRESHOLD))
 
 
 def parse_threshold(body: Any) -> float:
-    """`{"reject_threshold": 0.5}` menjadi 0.5. ValueError untuk apa pun selain itu, termasuk nilai
-    di luar (0, 1): 0 akan meloloskan setiap dokumen, 1 hampir tidak satu pun."""
-    value = body.get("reject_threshold") if isinstance(body, dict) else None
+    """`{"threshold": 0.5}` (atau kunci lama `reject_threshold`) menjadi 0.5. ValueError untuk apa pun selain
+    itu, termasuk nilai di luar (0, 1): 0 akan meloloskan setiap dokumen, 1 hampir tidak satu pun."""
+    if not isinstance(body, dict):
+        raise ValueError(f"not a JSON object: {body!r}")
+    value = body["threshold"] if "threshold" in body else body.get("reject_threshold")
     if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
-        raise ValueError(f"no numeric reject_threshold in {body!r}")
+        raise ValueError(f"no numeric threshold in {body!r}")
     if not 0 < value < 1:
-        raise ValueError(f"reject_threshold must be between 0 and 1, got {value}")
+        raise ValueError(f"threshold must be between 0 and 1, got {value}")
     return float(value)
 
 
