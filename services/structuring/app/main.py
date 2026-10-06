@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from ocr_common.pipeline.schemas import StageCallback
 from ocr_common.web.app import add_stage_callback_webhook, create_app, database_readiness
 
-from app.api import jobs, structuring, testing
+from app.api import direct, jobs, testing
 from app.config import get_settings
 from app.dependencies import (
     get_next_stage,
@@ -74,15 +74,19 @@ app = create_app(
         "arbitrase 89,9%. LLM mati secara default supaya service bisa berjalan tanpa kredensial AWS.\n\n"
         "**Pipeline asinkron:** service OCR POST /v1/structuring/jobs dan menerima 202; service ini bekerja di "
         "latar, menyimpan hasilnya, mengirim callback ke orchestrator, lalu menyerahkan job ke service scoring. "
-        "/v1/structuring/structure melakukan pekerjaan yang sama secara sinkron. Semua endpoint kecuali /health "
+        "/v1/structuring-direct menjalankan aturan yang sama secara sinkron atas hasil OCR, untuk menguji tahap ini "
+        "saja (QC); tidak ada yang dicatat. Semua endpoint kecuali /health "
         "memerlukan header X-API-Key."
     ),
     tags=[
         {"name": "Pipeline", "description": "Tahap pipeline asinkron: 202, kerja di latar, callback, penyerahan"},
         {"name": "Callbacks", "description": "Permintaan yang DIKIRIM service ini ke orchestrator (lihat Webhooks)"},
-        {"name": "Structuring", "description": "Teks OCR -> 20 field slip gaji, sinkron"},
+        {
+            "name": "Direct",
+            "description": "Tahap ini saja atas keluaran tahap sebelumnya, sinkron: tidak ada yang dicatat (QC)",
+        },
     ],
-    routers=[jobs.router, structuring.router, *([testing.router] if settings.testing_endpoints else [])],
+    routers=[jobs.router, direct.router, *([testing.router] if settings.testing_endpoints else [])],
     backends={
         "structuring": settings.structuring_backend,
         "storage": "postgres" if settings.database_url else "memory",

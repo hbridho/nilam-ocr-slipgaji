@@ -1,5 +1,5 @@
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, cast
 
 from starlette.concurrency import run_in_threadpool
 
@@ -98,8 +98,8 @@ class ScoringJobService:
                 if structuring is not None
                 else await load_upstream(self._results, "structuring", request_id)
             )
-            result = await run_in_threadpool(self._confidence.score, chain["structuring"])
-            return {**result, "column_confidence_threshold": columns}
+            result = cast(ScoringResult, await run_in_threadpool(self._confidence.score, chain["structuring"]))
+            return ScoringResult(**result, column_confidence_threshold=columns)
 
         def final(scoring: Mapping[str, Any]) -> FinalResult:
             return final_result(document_type, guardrails, chain["structuring"], scoring)

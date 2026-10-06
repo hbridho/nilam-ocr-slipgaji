@@ -30,7 +30,6 @@ from app.services.extract_service import ExtractOcrService
 router = APIRouter(tags=["Extract OCR"], dependencies=[Depends(verify_api_key)])
 
 RID = "OCR_9cb01af2-493d-446d-b191-af120333f6d0"
-INVALID_PARAMS_MESSAGE = "params must be valid JSON: an object, or a quoted string"
 DEFAULT_SEQUENCE_EXAMPLE = '["guardrails","extraction","structuring","scoring"]'
 
 _SLIP = {
@@ -65,9 +64,7 @@ _DATA = {
         {**_SLIP, "page": 3, "periode": {"value": "2025-04", "confidence": 1}},
     ],
 }
-_COMPLETED = extract_body(
-    200, COMPLETED_MESSAGE, data=_DATA, guardrails=0, request_id=RID, pipeline_last_stage="scoring"
-)
+_COMPLETED = extract_body(200, COMPLETED_MESSAGE, data=_DATA, guardrails=0, request_id=RID)
 _GUARDRAILS_ONLY = extract_body(
     200,
     COMPLETED_MESSAGE,
@@ -79,7 +76,6 @@ _GUARDRAILS_ONLY = extract_body(
             "confidence": 0.9934,
             "n_pages": 1,
             "threshold": 0.47,
-            "threshold_target": "accept",
         },
         "pages": [],
         "checks": {
@@ -92,9 +88,8 @@ _GUARDRAILS_ONLY = extract_body(
     },
     guardrails=0,
     request_id=RID,
-    pipeline_last_stage="guardrails",
 )
-_PROCESSING = extract_body(202, PROCESSING_MESSAGE, request_id=RID, pipeline_last_stage="structuring")
+_PROCESSING = extract_body(202, PROCESSING_MESSAGE, request_id=RID)
 _REJECTED = extract_body(
     400,
     "Dokumen ini bukan slip gaji. Mohon unggah slip gaji.",
@@ -123,12 +118,15 @@ _INVALID_SEQUENCE = extract_body(
 _CONTRACT_TABLE = (
     "| Hasil | HTTP | `data` | `guardrails` | `errors` | `pipeline_last_stage` |\n"
     "|---|---|---|---|---|---|\n"
-    "| Selesai | 200 | hasil service terakhir | `0` | null | service terakhir |\n"
-    "| Masih berjalan | 202 | null | null | null | service yang sedang berjalan |\n"
+    "| Selesai | 200 | hasil service terakhir | `0` | null | null |\n"
+    "| Masih berjalan | 202 | null | null | null | null |\n"
     f"| Ditahan guardrail | 400 | null | `1` | `{REJECTED_CODE}` | `guardrails` |\n"
     f"| Ditolak aturan structuring | 400 | null | `1` | `{REJECTED_CODE}` | `structuring` |\n"
     "| Sebuah tahap gagal | 422 | null | `0` | `OCR_FAILED` / `STRUCTURING_FAILED` / `SCORING_FAILED` | "
     "tahap itu |\n\n"
+    "Status HTTP (juga `status_code`) menyatakan keadaan permintaan: 200 selesai, 202 masih berjalan, 4xx / 5xx "
+    "gagal atau ditolak. `pipeline_last_stage` null pada jawaban sukses (200, 202) dan menyebut service asal "
+    "galat, atau `orchestrator` bila ditolak pintu masuk sendiri.\n\n"
 )
 _SEQUENCE_NOTE = (
     "**`pipeline_name_sequence` (saklar service).** Urutan baku `guardrails -> extraction -> structuring -> "
@@ -144,22 +142,6 @@ _MULTI_SLIP = (
     "**Satu dokumen bisa berisi beberapa slip** (tiga bulan dalam satu berkas adalah bentuk yang paling sering "
     "diunggah), jadi `data` pipeline penuh berisi `total_slip` dan array `slip`, satu entri per halaman."
 )
-
-
-class _InvalidParams(Exception):
-    pass
-
-
-def _parse_params(raw: str | None) -> Any:
-    if not raw:
-        return None
-    try:
-        value = json.loads(raw)
-    except ValueError as exc:
-        raise _InvalidParams from exc
-    if not isinstance(value, dict | str):
-        raise _InvalidParams
-    return value
 
 
 def _parse_sequence(raw: list[str] | None) -> list[str] | None:
@@ -201,8 +183,14 @@ def _parse_sequence(raw: list[str] | None) -> list[str] | None:
         + "\n\n"
         + _MULTI_SLIP
         + "\n\n**Confidence.** Setiap field `{value, confidence}`; `confidence` 1 ketika probabilitas model "
-        "keyakinan (0-1) >= ambang field itu (`column_confidence_threshold`, lalu `all_field`, lalu "
-        "`FIELD_CONFIDENCE_THRESHOLD` 0,5), selain itu 0. Callback membawa probabilitas 0-1 mentahnya.\n\n"
+        "keyakinan (0-1) >= ambang field itu, selain itu 0. Callback hasil membawa `data` yang sama persis.\n\n"
+        "**Ambang per permintaan, semuanya sisi accept (tanpa `guardrails_tendency`).** "
+        '`guardrails_confidence_threshold` = JSON object per guardrail: `{"acc_rej": 0.8}` (= `identity`, '
+        'P(slip gaji)) dan/atau `{"blur": 0.7}` (P(terbaca) = 1 - p_broken), 0 < x < 1. Tidak dikirim: ambang '
+        "bawaan tiap service guardrail. `column_confidence_threshold` = JSON object per field; `all_field` "
+        "disebar ke ke-20 field dan kunci field sendiri menang. Field yang tidak disebut: "
+        "`FIELD_CONFIDENCE_THRESHOLD` (0,5). Ambang yang tidak terbaca atau kunci tak dikenal: 422 "
+        "`INVALID_THRESHOLD`, tidak ada yang dijalankan.\n\n"
         "**Idempotensi.** request_id yang sama tidak menjalankan pipeline dua kali kecuali percobaan OCR "
         "sebelumnya `FAILED` atau melewati sewa job (`PIPELINE_JOB_LEASE_SECONDS`)."
     ),
@@ -235,7 +223,7 @@ def _parse_sequence(raw: list[str] | None) -> list[str] | None:
         422: {
             "model": ExtractOcrResponse,
             "description": (
-                "`INVALID_PIPELINE_SEQUENCE`, `INVALID_THRESHOLD`, `INVALID_PARAMS`, `VALIDATION_ERROR` (tidak ada "
+                "`INVALID_PIPELINE_SEQUENCE`, `INVALID_THRESHOLD`, `VALIDATION_ERROR` (tidak ada "
                 "yang dijalankan), atau sebuah tahap gagal: `OCR_FAILED`, `STRUCTURING_FAILED`, `SCORING_FAILED`"
             ),
             "content": {"application/json": {"example": _INVALID_SEQUENCE}},
@@ -260,11 +248,6 @@ async def extract_ocr(
     ),
     file: UploadFile | str | None = FileField,
     file_url: str | None = FileUrlField,
-    params: str | None = Form(
-        None,
-        description="Metadata klien (JSON object atau string berkutip), dikembalikan apa adanya di `params`",
-        examples=['{"nik": "3123456711950001", "refno": "PK19039Y8U"}'],
-    ),
     pipeline_name_sequence: list[str] | None = Form(
         None,
         description=(
@@ -276,26 +259,18 @@ async def extract_ocr(
     guardrails_confidence_threshold: str | None = Form(
         None,
         description=(
-            'Angka (0-1) untuk guardrail-identity, atau JSON per guardrail `{"identity": 0.8, "blur": 0.7}` '
-            "(`acc_rej` = `identity`). Tidak dikirim: ambang bawaan tiap service guardrail"
+            'JSON object per guardrail, sisi accept, 0 < x < 1: `{"acc_rej": 0.8}` (= `identity`, P(slip gaji)), '
+            '`{"blur": 0.7}` (P(terbaca)). Tidak dikirim: ambang bawaan tiap service guardrail'
         ),
-        examples=["0.8"],
-    ),
-    guardrails_tendency: str | None = Form(
-        None,
-        description=(
-            "Berpasangan dengan ambang di atas. `accepted` (bawaan): lolos bila P(accept) >= ambang. "
-            "`rejected`: ditolak bila P(reject) >= ambang"
-        ),
-        examples=["accepted"],
+        examples=['{"acc_rej": 0.8}'],
     ),
     column_confidence_threshold: str | None = Form(
         None,
         description=(
-            'JSON per field, sisi accept, mis. `{"gaji_bersih": 0.9, "all_field": 0.6}`. Field yang tidak disebut: '
-            "`all_field`, lalu `FIELD_CONFIDENCE_THRESHOLD` (0,5)"
+            'JSON per field, sisi accept: `{"all_field": 0.8}` untuk semua field, atau `{"gaji_bersih": 0.9}`; '
+            "kunci field sendiri menang atas `all_field`. Field yang tidak disebut: `FIELD_CONFIDENCE_THRESHOLD` (0,5)"
         ),
-        examples=['{"all_field": 0.5}'],
+        examples=['{"all_field": 0.8}'],
     ),
     service: ExtractOcrService = Depends(get_extract_service),
     settings: Settings = Depends(get_settings),
@@ -307,15 +282,11 @@ async def extract_ocr(
         return extract_body(status, message, errors=code, request_id=request_id, pipeline_last_stage=ENTRY)
 
     try:
-        parsed_params = _parse_params(params)
-    except _InvalidParams:
-        return refuse(422, INVALID_PARAMS_MESSAGE, "INVALID_PARAMS")
-    try:
         sequence = _parse_sequence(pipeline_name_sequence)
     except InvalidSequence as exc:
         return refuse(422, str(exc), "INVALID_PIPELINE_SEQUENCE")
     try:
-        guardrail_thresholds = parse_guardrails_threshold(guardrails_confidence_threshold, guardrails_tendency)
+        guardrail_thresholds = parse_guardrails_threshold(guardrails_confidence_threshold)
         columns = parse_column_thresholds(column_confidence_threshold)
     except InvalidThreshold as exc:
         return refuse(422, str(exc), "INVALID_THRESHOLD")
@@ -344,9 +315,7 @@ async def extract_ocr(
         )
     finally:
         reset_request_id(token)
-    status_code, body = extract_response(
-        outcome, request_id=request_id, params=parsed_params, threshold=settings.field_confidence_threshold
-    )
+    status_code, body = extract_response(outcome, request_id=request_id, threshold=settings.field_confidence_threshold)
     response.status_code = status_code
     return body
 
@@ -360,9 +329,7 @@ async def extract_ocr(
         "Membaca job tiap tahap milik `request_id` sekali, sampai service terakhir `pipeline_name_sequence` "
         "permintaan itu (tersimpan bersama job OCR), dan menjawab dengan kontrak yang sama seperti "
         "`POST /v1/extract-ocr` — termasuk confidence menurut `column_confidence_threshold` yang dikirim saat "
-        "POST:\n\n"
-        + _CONTRACT_TABLE
-        + "`params` selalu null di sini (tidak disimpan). **404** `REQUEST_ID_NOT_FOUND`: tidak ada job untuk "
+        "POST:\n\n" + _CONTRACT_TABLE + "**404** `REQUEST_ID_NOT_FOUND`: tidak ada job untuk "
         "request_id ini.\n\n"
         "**Batasan.** Penyerahan antar dua tahap yang gagal permanen membuat tahap berikutnya tidak punya job, "
         "sehingga endpoint ini terus menjawab `202`. Callback `FAILED` dan tabel Orkestrasi pusat yang menyimpan "
@@ -412,8 +379,6 @@ async def get_extract_ocr(
         outcome = await service.status(request_id)
     finally:
         reset_request_id(token)
-    status_code, body = extract_response(
-        outcome, request_id=request_id, params=None, threshold=settings.field_confidence_threshold
-    )
+    status_code, body = extract_response(outcome, request_id=request_id, threshold=settings.field_confidence_threshold)
     response.status_code = status_code
     return body

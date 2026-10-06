@@ -16,8 +16,8 @@ info:
 
     **Pipeline asinkron:** service OCR POST /v1/structuring/jobs dan menerima 202; service ini bekerja
     di latar, menyimpan hasilnya, mengirim callback ke orchestrator, lalu menyerahkan job ke service scoring.
-    /v1/structuring/structure melakukan pekerjaan yang sama secara sinkron. Semua endpoint kecuali /health
-    memerlukan header X-API-Key.
+    /v1/structuring-direct menjalankan aturan yang sama secara sinkron atas hasil OCR, untuk menguji tahap
+    ini saja (QC); tidak ada yang dicatat. Semua endpoint kecuali /health memerlukan header X-API-Key.
 
 
     ## Conventions (the same for every nilam-ocr service)
@@ -509,9 +509,9 @@ paths:
       summary: Backlog of this stage's undelivered callbacks and hand-offs
       description: 'Operational view of the transactional outbox (`PIPELINE_OUTBOX`): how many callbacks
         and hand-offs of this stage are still to be delivered, how old the oldest one is, and how many
-        were given up on (dead letters). No other service watches the `pipeline_outbox` table, so this
-        is where a monitor should look; the relay also logs a warning when the backlog is older than `PIPELINE_OUTBOX_STALE_AFTER_SECONDS`
-        or a dead letter is waiting.'
+        were given up on (dead letters). No other service watches the `nilam_pipeline_outbox` table, so
+        this is where a monitor should look; the relay also logs a warning when the backlog is older than
+        `PIPELINE_OUTBOX_STALE_AFTER_SECONDS` or a dead letter is waiting.'
       operationId: getStructuringOutboxStatus
       responses:
         '200':
@@ -662,41 +662,39 @@ paths:
                 pipeline_last_stage: structuring
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/structuring/structure:
+  /v1/structuring-direct:
     post:
       tags:
-      - Structuring
-      summary: Ubah teks OCR menjadi field slip gaji, sinkron (tanpa job, tanpa callback)
-      description: 'Memetakan teks OCR per halaman menjadi **20 field slip gaji**, satu himpunan field
-        per halaman.
+      - Direct
+      summary: Strukturkan hasil OCR sekarang, sinkron (tanpa job, tanpa callback, tanpa penyerahan)
+      description: '**Untuk menguji satu tahap saja (QC).** Menerima keluaran tahap sebelumnya, hasil
+        OCR service extraction (`data` dari `POST /v1/extraction/extract`, atau `result` job-nya), menjalankan
+        aturan structuring yang sama dengan pipeline, dan menjawab slip gaji terstruktur di badan respons.
+        Tidak ada yang dicatat: tidak ada baris `nilam_structuring_jobs`, callback, maupun penyerahan
+        ke scoring.
 
 
-        **Satu halaman = satu slip.** Berkas yang memuat tiga bulan menghasilkan tiga slip, masing-masing
-        dengan totalnya sendiri.
+        Jawabannya persis `result` pada `GET /v1/structuring/jobs/{request_id}` dan `structuring` yang
+        diterima tahap scoring: tempel ke `POST /v1/scoring-direct` untuk menguji tahap berikutnya.
 
 
-        Dua lapis, sama dengan pipeline penelitian: aturan (sinonim label, pembacaan kolom, turunan aritmetika
-        gaji bersih = total pendapatan − total potongan) dan, bila `ENABLE_LLM` menyala, arbitrase nilai
-        uang lewat Bedrock. Terukur pada 50 dokumen berlabel: aturan saja 81,5% field benar, dengan arbitrase
-        89,9%.
-
-
-        `source`, `checks`, `counts` dan `llm.compare` ikut dikembalikan bukan sebagai hiasan: tahap scoring
-        membacanya sebagai fitur model keyakinan.'
-      operationId: structurePages
+        **Satu halaman = satu slip.** Dua lapis: aturan (sinonim label, pembacaan kolom, turunan aritmetika)
+        dan, bila `ENABLE_LLM` menyala, arbitrase nilai uang lewat LLM. Hasil OCR tanpa satu pun halaman
+        berteks: 400.'
+      operationId: structureDirect
       requestBody:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/StructureRequest'
+              $ref: '#/components/schemas/StructuringDirectRequest'
         required: true
       responses:
         '200':
-          description: Field yang ditemukan
+          description: Hasil OCR sudah distrukturkan
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/StructureResponse'
+                $ref: '#/components/schemas/StructuringDirectResponse'
               examples:
                 tiga_slip:
                   summary: Satu berkas berisi tiga bulan
@@ -838,7 +836,7 @@ paths:
                       elapsed_ms: 227.5
                     request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
         '400':
-          description: Tidak ada teks yang bisa distrukturkan
+          description: Tidak ada teks yang bisa distrukturkan, atau `document_type` tidak didukung
           content:
             application/json:
               schema:
@@ -870,7 +868,7 @@ paths:
               example:
                 status_code: 422
                 status_desc: Unprocessable Entity
-                message: 'body.pages: Field required'
+                message: 'body.ocr: Field required'
                 errors: VALIDATION_ERROR
                 pipeline_last_stage: structuring
       security:
@@ -1025,15 +1023,6 @@ components:
           description: Ambang yang dipakai pemeriksaan penentu
           examples:
           - 0.47
-        threshold_target:
-          anyOf:
-          - type: string
-            enum:
-            - accept
-            - reject
-          - type: 'null'
-          title: Threshold Target
-          description: Sisi ambang
       additionalProperties: true
       type: object
       title: GuardrailsDocument
@@ -1234,7 +1223,7 @@ components:
       - data
       title: JobAcceptedResponse
       description: Envelope of `POST /v1/<stage>/jobs`.
-    OcrPageIn:
+    OcrPagePayload:
       properties:
         page:
           type: integer
@@ -1247,21 +1236,71 @@ components:
         text:
           type: string
           title: Text
-          description: Teks OCR halaman ini, urut baca
-          examples:
-          - 'SLIP GAJI
-
-            Gaji Pokok  Rp 4.500.000'
+          description: Teks halaman ini dalam urutan baca
         confidence:
           additionalProperties: true
           type: object
           title: Confidence
-          description: Ringkasan skor OCR halaman ini; diteruskan ke tahap scoring sebagai fitur mutu
-            OCR
+          description: Ringkasan skor OCR halaman ini (mean, min, p10, n_low)
+      additionalProperties: true
       type: object
       required:
       - text
-      title: OcrPageIn
+      title: OcrPagePayload
+      description: Satu halaman hasil OCR.
+    OcrPayload:
+      properties:
+        engine:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Engine
+          description: Backend OCR yang membaca dokumen
+          examples:
+          - rapidocr
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+          description: Identitas model yang dilaporkan mesin OCR
+          examples:
+          - rapidocr
+        elapsed_ms:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Elapsed Ms
+          description: Waktu di dalam mesin OCR, milidetik
+          examples:
+          - 2841.7
+        n_pages:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: N Pages
+          description: Halaman yang dibaca
+          examples:
+          - 3
+        full_text:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Full Text
+          description: Seluruh halaman digabung; dipakai guardrail
+        pages:
+          items:
+            $ref: '#/components/schemas/OcrPagePayload'
+          type: array
+          title: Pages
+          description: 'Satu entri per halaman. **Satu halaman = satu slip**: berkas yang memuat tiga
+            bulan menghasilkan tiga slip, dan menggabungkan teksnya akan mencampur komponen satu bulan
+            ke total bulan lain'
+      additionalProperties: true
+      type: object
+      title: OcrPayload
+      description: Hasil tahap OCR (`nilam_ocr_results`), diteruskan ke structuring dan scoring.
     OutboxRelease:
       properties:
         stage:
@@ -1378,8 +1417,8 @@ components:
           type: integer
           title: Dead Letters
           description: Messages given up on (a 4xx from the receiver, or 5xx for longer than `PIPELINE_OUTBOX_MAX_AGE_SECONDS`).
-            They stay in `pipeline_outbox` with `failed_at` and `last_error` for inspection and are never
-            retried; anything above 0 needs a human
+            They stay in `nilam_pipeline_outbox` with `failed_at` and `last_error` for inspection and
+            are never retried; anything above 0 needs a human
           examples:
           - 0
       type: object
@@ -1578,22 +1617,32 @@ components:
       - status
       title: StageCallback
       description: Isi callback yang dikirim sebuah tahap ke orchestrator saat selesai.
-    StructureRequest:
+    StructuringDirectRequest:
       properties:
-        pages:
-          items:
-            $ref: '#/components/schemas/OcrPageIn'
-          type: array
-          minItems: 1
-          title: Pages
-          description: 'Halaman hasil OCR. **Satu halaman = satu slip**: berkas tiga bulan menghasilkan
-            tiga slip. Jangan menggabungkan teks halaman — komponen satu bulan akan tercampur ke total
-            bulan lain'
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: Diulang di respons; opsional
+          examples:
+          - QC_1
+        document_type:
+          type: string
+          title: Document Type
+          description: Hanya `slip_gaji`
+          default: slip_gaji
+          examples:
+          - slip_gaji
+        ocr:
+          $ref: '#/components/schemas/OcrPayload'
+          description: 'Hasil tahap OCR apa adanya: `data` dari `POST /v1/extraction/extract`, atau `result`
+            job OCR. Yang dibaca hanya `pages[]` (teks + ringkasan skor OCR per halaman)'
       type: object
       required:
-      - pages
-      title: StructureRequest
-    StructureResponse:
+      - ocr
+      title: StructuringDirectRequest
+    StructuringDirectResponse:
       properties:
         status_code:
           type: integer
@@ -1634,7 +1683,7 @@ components:
       type: object
       required:
       - data
-      title: StructureResponse
+      title: StructuringDirectResponse
     StructuringJobRequest:
       properties:
         request_id:
@@ -1753,9 +1802,12 @@ components:
             type: object
           - type: 'null'
           title: Column Confidence Threshold
-          description: The request's per-field thresholds (0-1); null when not sent
+          description: 'The central orchestrator''s per-field thresholds (0-1) the job was submitted with
+            (an `all_field` it sent is already spread over the 20 slip fields); null when none were given:
+            `FIELD_CONFIDENCE_THRESHOLD` for every field'
           examples:
-          - null
+          - gaji_bersih: 0.9
+            gaji_pokok: 0.9
         result:
           anyOf:
           - $ref: '#/components/schemas/StructuringResult'
@@ -1867,7 +1919,7 @@ tags:
   description: 'Tahap pipeline asinkron: 202, kerja di latar, callback, penyerahan'
 - name: Callbacks
   description: Permintaan yang DIKIRIM service ini ke orchestrator (lihat Webhooks)
-- name: Structuring
-  description: Teks OCR -> 20 field slip gaji, sinkron
+- name: Direct
+  description: 'Tahap ini saja atas keluaran tahap sebelumnya, sinkron: tidak ada yang dicatat (QC)'
 - name: Health
   description: Health and readiness checks; no API key

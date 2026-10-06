@@ -18,8 +18,8 @@ from ocr_common.web.request_id import get_request_id
 from ocr_common.web.schemas import REQUEST_ID_EXAMPLE, UNAUTHORIZED, JobAcceptedResponse, error, success_examples
 from ocr_common.web.security import verify_api_key
 
+from app.api.direct import SCORING_EXAMPLE
 from app.api.schemas import ScoringJobRequest, ScoringJobStatusResponse
-from app.api.scoring import SCORING_EXAMPLE
 from app.dependencies import get_job_service, get_pipeline
 from app.services.job_service import ScoringJobService
 

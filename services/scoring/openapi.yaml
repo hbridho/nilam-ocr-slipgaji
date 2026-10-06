@@ -14,8 +14,9 @@ info:
 
 
     **Pipeline asinkron:** service structuring POST /v1/scoring/jobs dan menerima 202; service ini memberi
-    skor di latar, menyimpan hasilnya, dan mengirim callback berisi hasil akhir ke orchestrator. /v1/scoring/score
-    melakukan pekerjaan yang sama secara sinkron. Semua endpoint kecuali /health memerlukan header X-API-Key.
+    skor di latar, menyimpan hasilnya, dan mengirim callback berisi hasil akhir ke orchestrator. /v1/scoring-direct
+    menjalankan model yang sama secara sinkron atas hasil structuring, untuk menguji tahap ini saja (QC);
+    tidak ada yang dicatat. Semua endpoint kecuali /health memerlukan header X-API-Key.
 
 
     ## Conventions (the same for every nilam-ocr service)
@@ -319,13 +320,13 @@ paths:
                         slips:
                         - slip_no: 1
                           scores:
-                            nama_karyawan: 76.71
-                            jabatan: 76.71
-                            gaji_pokok: 93.6
-                            tunjangan_makan: 88.89
-                            total_pendapatan: 92.47
-                            gaji_bersih: 92.47
-                        threshold: 80.0
+                            nama_karyawan: 0.7671
+                            jabatan: 0.7671
+                            gaji_pokok: 0.936
+                            tunjangan_makan: 0.8889
+                            total_pendapatan: 0.9247
+                            gaji_bersih: 0.9247
+                        threshold: 0.5
                         model: conf_v2
                       updated_at: '2026-09-18T04:00:01+00:00'
                     request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
@@ -388,9 +389,9 @@ paths:
       summary: Backlog of this stage's undelivered callbacks and hand-offs
       description: 'Operational view of the transactional outbox (`PIPELINE_OUTBOX`): how many callbacks
         and hand-offs of this stage are still to be delivered, how old the oldest one is, and how many
-        were given up on (dead letters). No other service watches the `pipeline_outbox` table, so this
-        is where a monitor should look; the relay also logs a warning when the backlog is older than `PIPELINE_OUTBOX_STALE_AFTER_SECONDS`
-        or a dead letter is waiting.'
+        were given up on (dead letters). No other service watches the `nilam_pipeline_outbox` table, so
+        this is where a monitor should look; the relay also logs a warning when the backlog is older than
+        `PIPELINE_OUTBOX_STALE_AFTER_SECONDS` or a dead letter is waiting.'
       operationId: getScoringOutboxStatus
       responses:
         '200':
@@ -541,42 +542,35 @@ paths:
                 pipeline_last_stage: scoring
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/scoring/score:
+  /v1/scoring-direct:
     post:
       tags:
-      - Scoring
-      summary: Skor keyakinan per field, sinkron (tanpa job, tanpa callback)
-      description: 'Menghitung **P(nilai field ini benar)** untuk setiap nilai yang diextraction, sebagai
-        skor 0-1 yang sudah dikalibrasi (isotonic), lalu dikembalikan apa adanya.
+      - Direct
+      summary: Beri skor slip terstruktur sekarang, sinkron (tanpa job, tanpa callback)
+      description: '**Untuk menguji satu tahap saja (QC).** Menerima keluaran tahap sebelumnya, hasil
+        structuring (`data` dari `POST /v1/structuring-direct`, atau `result` job structuring), menjalankan
+        model keyakinan, dan menjawab di badan respons. Tidak ada yang dicatat: tidak ada baris `nilam_scoring_jobs`,
+        callback, maupun baris hasil Orkestrasi.
 
 
-        Modelnya regresi logistik atas 9 variabel + one-hot field: kesepakatan regex vs LLM, jarak nominal
-        ke median field, seberapa sering field ini benar-benar ada, jumlah digit, hasil cek aritmetika,
-        nilai nol, dan porsi kotak OCR berskor rendah di halaman. Dilatih pada 1.428 nilai dari 50 dokumen
-        berlabel; out-of-fold (GroupKFold per dokumen): AUC 0,826 · Gini 0,652 · ECE 0,037.
-
-
-        **Tidak ada keputusan di sini.** Pemetaan ke `confidence` 0/1 terjadi di kontrak `extract-ocr`
-        memakai `threshold`, supaya ambangnya bisa diubah tanpa melatih ulang apa pun. Pada ambang 80:
-        precision 93,4%, recall 75,6%.
-
-
-        Field tanpa nilai tidak diberi skor: tidak ada yang perlu dinilai di sana, dan memberinya 0 akan
-        tercampur dengan nilai yang benar-benar diragukan.'
-      operationId: scoreSlips
+        Jawabannya `result` yang sama seperti `GET /v1/scoring/jobs/{request_id}` (P(nilai benar) 0-1
+        per field), ditambah `data`: kontrak `extract-ocr` dengan confidence 0/1 menurut `column_confidence_threshold`
+        (`all_field` disebar ke semua field; kunci field sendiri menang), lalu `FIELD_CONFIDENCE_THRESHOLD`.
+        Field tanpa nilai tidak diberi skor.'
+      operationId: scoreDirect
       requestBody:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ScoreRequest'
+              $ref: '#/components/schemas/ScoringDirectRequest'
         required: true
       responses:
         '200':
-          description: Skor untuk tiap slip
+          description: Slip terstruktur sudah dinilai
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ScoreResponse'
+                $ref: '#/components/schemas/ScoringDirectResponse'
               examples:
                 satu_slip:
                   summary: Satu slip
@@ -588,17 +582,28 @@ paths:
                       slips:
                       - slip_no: 1
                         scores:
-                          nama_karyawan: 76.71
-                          jabatan: 76.71
-                          gaji_pokok: 93.6
-                          tunjangan_makan: 88.89
-                          total_pendapatan: 92.47
-                          gaji_bersih: 92.47
-                      threshold: 80.0
+                          nama_karyawan: 0.7671
+                          jabatan: 0.7671
+                          gaji_pokok: 0.936
+                          tunjangan_makan: 0.8889
+                          total_pendapatan: 0.9247
+                          gaji_bersih: 0.9247
+                      threshold: 0.5
                       model: conf_v2
+                      data:
+                        total_slip: 1
+                        slip:
+                        - page: 1
+                          gaji_pokok:
+                            value: 4500000
+                            confidence: 1
+                          gaji_bersih:
+                            value: 5855000
+                            confidence: 1
+                          missing_mandatory_fields: []
                     request_id: REQ_9cb01af2-493d-446d-b191-af120333f6d0
         '400':
-          description: Tidak ada slip untuk dinilai
+          description: Tidak ada slip, atau `document_type` tidak didukung
           content:
             application/json:
               schema:
@@ -630,7 +635,7 @@ paths:
               example:
                 status_code: 422
                 status_desc: Unprocessable Entity
-                message: 'body.slips: Field required'
+                message: 'body.structuring: Field required'
                 errors: VALIDATION_ERROR
                 pipeline_last_stage: scoring
         '500':
@@ -873,15 +878,6 @@ components:
           description: Ambang yang dipakai pemeriksaan penentu
           examples:
           - 0.47
-        threshold_target:
-          anyOf:
-          - type: string
-            enum:
-            - accept
-            - reject
-          - type: 'null'
-          title: Threshold Target
-          description: Sisi ambang
       additionalProperties: true
       type: object
       title: GuardrailsDocument
@@ -1198,8 +1194,8 @@ components:
           type: integer
           title: Dead Letters
           description: Messages given up on (a 4xx from the receiver, or 5xx for longer than `PIPELINE_OUTBOX_MAX_AGE_SECONDS`).
-            They stay in `pipeline_outbox` with `failed_at` and `last_error` for inspection and are never
-            retried; anything above 0 needs a human
+            They stay in `nilam_pipeline_outbox` with `failed_at` and `last_error` for inspection and
+            are never retried; anything above 0 needs a human
           examples:
           - 0
       type: object
@@ -1282,23 +1278,49 @@ components:
       - checks
       title: ReadyResponse
       description: '`GET /ready`.'
-    ScoreRequest:
+    ScoringDirectRequest:
       properties:
-        slips:
-          items:
-            $ref: '#/components/schemas/SlipPayload'
-          type: array
-          minItems: 1
-          title: Slips
-          description: 'Slip hasil tahap structuring, apa adanya. `source`, `checks`, `counts`, `llm.compare`,
-            `ocr_text` dan `ocr_confidence` harus ikut: fitur terkuat model justru berasal dari jejak
-            itu — kesepakatan regex vs LLM, jarak nominal ke median field, dan porsi kotak OCR berskor
-            rendah di halaman'
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
+          description: Diulang di respons; opsional
+          examples:
+          - QC_1
+        document_type:
+          type: string
+          title: Document Type
+          description: Hanya `slip_gaji`
+          default: slip_gaji
+          examples:
+          - slip_gaji
+        guardrails:
+          anyOf:
+          - $ref: '#/components/schemas/GuardrailsPayload'
+          - type: 'null'
+          description: Laporan guardrail; opsional, dikembalikan apa adanya
+        structuring:
+          $ref: '#/components/schemas/StructuringPayload'
+          description: 'Hasil tahap structuring apa adanya (`data` dari `POST /v1/structuring-direct`).
+            `source`, `checks`, `counts`, `llm.compare`, `ocr_text` dan `ocr_confidence` tiap slip harus
+            ikut: fitur terkuat model berasal dari jejak itu'
+        column_confidence_threshold:
+          anyOf:
+          - additionalProperties:
+              type: number
+            type: object
+          - type: 'null'
+          title: Column Confidence Threshold
+          description: 'Ambang per field (0-1), `{"all_field": 0.8}` atau `{"gaji_bersih": 0.9}`; kunci
+            field menang'
+          examples:
+          - all_field: 0.8
       type: object
       required:
-      - slips
-      title: ScoreRequest
-    ScoreResponse:
+      - structuring
+      title: ScoringDirectRequest
+    ScoringDirectResponse:
       properties:
         status_code:
           type: integer
@@ -1335,11 +1357,60 @@ components:
           examples:
           - REQ_9cb01af2-493d-446d-b191-af120333f6d0
         data:
-          $ref: '#/components/schemas/ScoringResult'
+          $ref: '#/components/schemas/ScoringDirectResult'
       type: object
       required:
       - data
-      title: ScoreResponse
+      title: ScoringDirectResponse
+    ScoringDirectResult:
+      properties:
+        slips:
+          items:
+            $ref: '#/components/schemas/SlipScores'
+          type: array
+          title: Slips
+          description: Satu entri per slip
+        threshold:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Threshold
+          description: 'Ambang bawaan (0-1) yang memisahkan `confidence: 1` dari `0` di kontrak `extract-ocr`
+            (`FIELD_CONFIDENCE_THRESHOLD`); `column_confidence_threshold` permintaan menimpanya per field.
+            Skor mentah tetap dikembalikan, supaya ambangnya bisa diubah tanpa melatih ulang apa pun'
+          examples:
+          - 0.5
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+          description: Backend model yang memberi skor
+          examples:
+          - conf_v2
+        column_confidence_threshold:
+          anyOf:
+          - additionalProperties:
+              type: number
+            type: object
+          - type: 'null'
+          title: Column Confidence Threshold
+          description: Ambang per field dari permintaan (`column_confidence_threshold`); null bila tidak
+            dikirim
+          examples:
+          - gaji_bersih: 0.9
+        data:
+          additionalProperties: true
+          type: object
+          title: Data
+          description: 'Kontrak `extract-ocr`: `{total_slip, slip[]}`, tiap field `{value, confidence
+            0/1}` menurut `column_confidence_threshold`, lalu `FIELD_CONFIDENCE_THRESHOLD`'
+      type: object
+      required:
+      - slips
+      - threshold
+      - data
+      title: ScoringDirectResult
     ScoringJobRequest:
       properties:
         request_id:
@@ -1372,7 +1443,7 @@ components:
           - type: 'null'
           title: Structuring
           description: 'Hasil tahap structuring. Boleh dihilangkan bila `PIPELINE_HANDOFF_BY_REFERENCE`
-            menyala: service ini membacanya dari `structuring_results` memakai request_id'
+            menyala: service ini membacanya dari `nilam_structuring_results` memakai request_id'
         pipeline_name_sequence:
           anyOf:
           - items:
@@ -1464,9 +1535,12 @@ components:
             type: object
           - type: 'null'
           title: Column Confidence Threshold
-          description: The request's per-field thresholds (0-1); null when not sent
+          description: 'The central orchestrator''s per-field thresholds (0-1) the job was submitted with
+            (an `all_field` it sent is already spread over the 20 slip fields); null when none were given:
+            `FIELD_CONFIDENCE_THRESHOLD` for every field'
           examples:
-          - null
+          - gaji_bersih: 0.9
+            gaji_pokok: 0.9
         result:
           anyOf:
           - $ref: '#/components/schemas/ScoringResult'
@@ -1557,8 +1631,7 @@ components:
           description: Ambang per field dari permintaan (`column_confidence_threshold`); null bila tidak
             dikirim
           examples:
-          - all_field: 0.6
-            gaji_bersih: 0.9
+          - gaji_bersih: 0.9
       type: object
       required:
       - slips
@@ -1708,6 +1781,49 @@ components:
       - slip_no
       - scores
       title: SlipScores
+    StructuringPayload:
+      properties:
+        document_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Document Type
+          description: Jenis dokumen
+          examples:
+          - slip_gaji
+        n_slips:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: N Slips
+          description: Jumlah slip di dokumen ini
+          examples:
+          - 3
+        slips:
+          items:
+            $ref: '#/components/schemas/SlipPayload'
+          type: array
+          title: Slips
+          description: Satu entri per slip, urut halaman
+        llm_used:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Llm Used
+          description: true bila arbitrase LLM benar-benar dipanggil
+        reject_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reject Reason
+          description: Terisi bila aturan structuring menolak dokumen
+      additionalProperties: true
+      type: object
+      required:
+      - slips
+      title: StructuringPayload
+      description: Hasil tahap structuring (`structuring_results`), diteruskan ke scoring.
   securitySchemes:
     APIKeyHeader:
       type: apiKey
@@ -1719,7 +1835,7 @@ tags:
   description: 'Tahap pipeline asinkron: 202, kerja di latar, callback'
 - name: Callbacks
   description: Permintaan yang DIKIRIM service ini ke orchestrator (lihat Webhooks)
-- name: Scoring
-  description: Skor keyakinan per field, sinkron
+- name: Direct
+  description: 'Tahap ini saja atas keluaran tahap sebelumnya, sinkron: tidak ada yang dicatat (QC)'
 - name: Health
   description: Health and readiness checks; no API key

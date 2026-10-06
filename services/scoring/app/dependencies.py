@@ -28,8 +28,26 @@ from app.services.job_service import ScoringJobService
 DB_TABLE_PREFIX = "scoring"
 
 # SCORING_BACKEND -> cara membangunnya. Tambahkan backend di sini dan, kalau butuh setelan, di config.py.
+
+
+def _with_model(settings, build):
+    """Point slip_ml at the model file (conf.json: baked in the image, or downloaded from
+    SCORING_MODEL_GCS_URI at start), then build the backend."""
+    from ocr_common.clients.models import model_file
+
+    from slip_ml import models
+
+    models.use(
+        models.CONFIDENCE,
+        model_file(
+            models.baked(models.CONFIDENCE), settings.scoring_model_gcs_uri, settings.scoring_model_sha256, settings
+        ),
+    )
+    return build()
+
+
 MODEL_BACKENDS: dict[str, Factory[ConfidenceModel]] = {
-    "conf_v2": lambda settings: SlipConfidenceModel(),
+    "conf_v2": lambda settings: _with_model(settings, SlipConfidenceModel),
     "mock": lambda settings: MockConfidenceModel(),
 }
 

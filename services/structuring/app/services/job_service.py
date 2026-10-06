@@ -7,7 +7,7 @@ from ocr_common.errors import UnprocessableEntity
 from ocr_common.pipeline import STRUCTURING, HandoffPayload, StagePipeline, Work, chain
 from ocr_common.pipeline.results import StageResults, load_upstream
 from ocr_common.slip_gaji import DOCUMENT_TYPE, structuring_data
-from ocr_common.types import OcrPage, StructuringResult
+from ocr_common.types import StructuringResult
 
 from app.services.structuring_service import StructuringService
 
@@ -51,7 +51,7 @@ class StructuringJobService:
         if ocr is None and self._results is None:
             raise UnprocessableEntity(
                 "ocr is missing: the request refers to the OCR result by request_id, but this service has no "
-                "DATABASE_URL to read ocr_results from",
+                "DATABASE_URL to read nilam_ocr_results from",
             )
         work, handoff = self._spec(request_id, document_type, guardrails, ocr, sequence, columns)
         return await self._pipeline.submit(
@@ -107,14 +107,7 @@ class StructuringJobService:
 
         async def work() -> StructuringResult:
             state["ocr"] = ocr if ocr is not None else await load_upstream(self._results, "ocr", request_id)
-            pages: list[OcrPage] = [
-                {
-                    "page": page.get("page") or index,
-                    "text": page.get("text") or "",
-                    "confidence": page.get("confidence") or {},
-                }
-                for index, page in enumerate(state["ocr"].get("pages") or [], start=1)
-            ]
+            pages = StructuringService.pages_from_ocr(state["ocr"])
             return await run_in_threadpool(self._structuring.structure, pages)
 
         def handoff(structuring: Mapping[str, Any]) -> dict[str, Any]:

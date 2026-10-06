@@ -2,7 +2,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from ocr_common.pipeline.schemas import GuardrailsPayload
+from ocr_common.pipeline.schemas import GuardrailsPayload, OcrPayload
 from ocr_common.slip_gaji import SLIP_FIELDS
 from ocr_common.web.schemas import JobStatusBase, SuccessEnvelope
 
@@ -17,17 +17,6 @@ class OcrPageIn(BaseModel):
     confidence: dict[str, Any] = Field(
         default_factory=dict,
         description="Ringkasan skor OCR halaman ini; diteruskan ke tahap scoring sebagai fitur mutu OCR",
-    )
-
-
-class StructureRequest(BaseModel):
-    pages: list[OcrPageIn] = Field(
-        ...,
-        min_length=1,
-        description=(
-            "Halaman hasil OCR. **Satu halaman = satu slip**: berkas tiga bulan menghasilkan tiga slip. "
-            "Jangan menggabungkan teks halaman — komponen satu bulan akan tercampur ke total bulan lain"
-        ),
     )
 
 
@@ -65,7 +54,19 @@ class StructuringResult(BaseModel):
     )
 
 
-class StructureResponse(SuccessEnvelope):
+class StructuringDirectRequest(BaseModel):
+    request_id: str | None = Field(None, description="Diulang di respons; opsional", examples=["QC_1"])
+    document_type: str = Field("slip_gaji", description="Hanya `slip_gaji`", examples=["slip_gaji"])
+    ocr: OcrPayload = Field(
+        ...,
+        description=(
+            "Hasil tahap OCR apa adanya: `data` dari `POST /v1/extraction/extract`, atau `result` job OCR. "
+            "Yang dibaca hanya `pages[]` (teks + ringkasan skor OCR per halaman)"
+        ),
+    )
+
+
+class StructuringDirectResponse(SuccessEnvelope):
     data: StructuringResult
 
 

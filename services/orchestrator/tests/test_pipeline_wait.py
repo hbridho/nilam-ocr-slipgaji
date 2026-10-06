@@ -43,7 +43,7 @@ def test_finished_within_the_wait_is_200_with_the_final_result(client, auth, stu
 
     assert response.status_code == 200
     body = response.json()
-    assert (body["guardrails"], body["errors"], body["pipeline_last_stage"]) == (0, None, "scoring")
+    assert (body["guardrails"], body["errors"], body["pipeline_last_stage"]) == (0, None, None)
     assert body["data"]["total_slip"] == 2
     assert body["data"]["slip"][0]["gaji_pokok"] == {"value": 4500000, "confidence": 1}
     assert body["data"]["slip"][0]["nama_karyawan"] == {"value": "ANDI SAPUTRA", "confidence": 0}  # 0,42 < 0,5
@@ -64,12 +64,7 @@ def test_still_running_when_the_wait_runs_out_is_202(client, auth, stub_waiter):
         "Accepted",
         "OCR job accepted; still processing",
     )
-    assert (body["data"], body["guardrails"], body["errors"], body["pipeline_last_stage"]) == (
-        None,
-        None,
-        None,
-        "structuring",
-    )
+    assert (body["data"], body["guardrails"], body["errors"], body["pipeline_last_stage"]) == (None, None, None, None)
 
 
 def test_failure_within_the_wait_is_422_with_the_failed_stage(client, auth, stub_waiter):

@@ -127,19 +127,11 @@ class ExtractOcrResponse(BaseModel):
     pipeline_last_stage: Literal["orchestrator", "guardrails", "extraction", "structuring", "scoring"] | None = Field(
         None,
         description=(
-            "Service asal jawaban, dengan nama yang sama seperti di `pipeline_name_sequence`: service yang "
-            "menyelesaikan, menolak, gagal, atau sedang berjalan — atau `orchestrator` bila permintaan ditolak "
-            "pintu masuk sendiri sebelum satu pun service pipeline dipanggil (kunci API, berkas, parameter, "
-            "request_id tidak dikenal pada `GET`). Penolakan guardrail-blank / -blur / -identity dilaporkan "
-            "sebagai `guardrails`."
+            "Null pada jawaban sukses (200, 202). Pada galat: service asal galat, dengan nama yang sama seperti di "
+            "`pipeline_name_sequence` — yang menolak (`guardrails`: guardrail-blank / -blur / -identity, atau "
+            "`structuring`), yang gagal, atau yang tidak terjangkau — atau `orchestrator` bila permintaan ditolak "
+            "pintu masuk sendiri sebelum satu pun service pipeline dipanggil (kunci API, berkas, urutan, ambang, "
+            "`document_type`, request_id tidak dikenal pada `GET`)"
         ),
-        examples=["scoring"],
-    )
-    params: Any = Field(
-        None,
-        description=(
-            "`params` yang dikirim bersama `POST /v1/extract-ocr`, dikembalikan apa adanya; null bila tidak "
-            "dikirim. Tidak disimpan, jadi selalu null pada `GET /v1/extract-ocr/{request_id}`"
-        ),
-        examples=[{"nik": "3123456711950001", "refno": "PK19039Y8U"}],
+        examples=["structuring"],
     )

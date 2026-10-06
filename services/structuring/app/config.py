@@ -48,13 +48,13 @@ class Settings(PipelineSettings):
     # yang ada penunjuknya:
     #   file (bawaan): PROMPT_PATH, bawaannya services/structuring/prompts/slip_gaji.v1.md di dalam image;
     #                  boleh absolut, jadi prompt bisa dipasang sebagai ConfigMap/volume tanpa rebuild.
-    #   db:            baris tabel PROMPT_DB_TABLE (migrasi 0010) dengan PROMPT_NAME / PROMPT_VERSION;
-    #                  versi kosong = baris `active` terbaru.
+    #   db:            tabel `system_prompt` (DDL tim, migrasi 0010): PROMPT_VERSION kosong = satu-satunya
+    #                  baris `is_active`; diisi = versi itu. PROMPT_NAME hanya label di log.
     prompt_source: str = "file"
     prompt_name: str = "slip_gaji"
     prompt_version: int | None = None
     prompt_path: str = str(DEFAULT_PROMPT_PATH)
-    prompt_db_table: str = "prompts"
+    prompt_db_table: str = "nilam_ocr_slipgaji.system_prompt"
     # Basis data tidak terbaca saat start -> pakai PROMPT_PATH dengan peringatan (bawaan), supaya
     # gangguan basis data tidak ikut mematikan structuring. `false`: menolak start.
     prompt_db_fallback_to_file: bool = True

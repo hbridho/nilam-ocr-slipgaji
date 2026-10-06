@@ -39,7 +39,7 @@ def _get(client, auth, request_id=RID):
 # --- the endpoint -----------------------------------------------------------------------------------
 
 
-def test_finished_request_is_200_with_its_data_and_no_params(client, auth, stub_waiter):
+def test_finished_request_is_200_with_its_data(client, auth, stub_waiter):
     response = _get(client, auth)
 
     assert response.status_code == 200
@@ -47,12 +47,7 @@ def test_finished_request_is_200_with_its_data_and_no_params(client, auth, stub_
     assert (body["status_code"], body["status_desc"]) == (200, "OK")
     assert body["message"] == "OCR extraction completed successfully"
     assert body["request_id"] == RID
-    assert (body["guardrails"], body["errors"], body["params"], body["pipeline_last_stage"]) == (
-        0,
-        None,
-        None,
-        "scoring",
-    )
+    assert (body["guardrails"], body["errors"], body["pipeline_last_stage"]) == (0, None, None)
     assert body["data"]["total_slip"] == 2
     assert stub_waiter.snapshots == [RID]
     assert stub_waiter.calls == [], "the status is read, not waited for"
@@ -64,7 +59,7 @@ def test_running_request_is_202(client, auth, stub_waiter):
     response = _get(client, auth)
 
     assert response.status_code == 202
-    assert (response.json()["pipeline_last_stage"], response.json()["guardrails"]) == ("structuring", None)
+    assert (response.json()["pipeline_last_stage"], response.json()["guardrails"]) == (None, None)
 
 
 def test_failed_stage_is_422(client, auth, stub_waiter):

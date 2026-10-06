@@ -126,32 +126,46 @@ def test_health_lists_backend(client):
     assert client.get("/health").json()["backends"] == {"structuring": "slip_rules", "storage": "memory"}
 
 
-def test_http_structure(client, auth):
-    response = client.post("/v1/structuring/structure", json={"pages": PAGES}, headers=auth)
+def _direct(client, auth, pages, **body):
+    return client.post("/v1/structuring-direct", json={"ocr": {"pages": pages}, **body}, headers=auth)
+
+
+def test_structuring_direct_structures_an_ocr_result_and_records_nothing(client, auth):
+    response = _direct(client, auth, PAGES, request_id="QC_1")
 
     assert response.status_code == 200
-    data = response.json()["data"]
+    body = response.json()
+    assert body["request_id"] == "QC_1"
+    data = body["data"]
     assert data["document_type"] == "slip_gaji"
     assert data["n_slips"] == 2
     assert data["slips"][0]["fields"]["nama_karyawan"] == "ANDI SAPUTRA"
     assert data["reject_reason"] is None
+    assert client.get("/v1/structuring/jobs/QC_1", headers=auth).status_code == 404
 
 
-def test_http_structure_blank_pages_returns_400(client, auth):
-    response = client.post("/v1/structuring/structure", json={"pages": [{"page": 1, "text": " "}]}, headers=auth)
+def test_structuring_direct_blank_pages_returns_400(client, auth):
+    response = _direct(client, auth, [{"page": 1, "text": " "}])
 
     assert response.status_code == 400
     assert response.json()["message"] == "tidak ada teks OCR yang bisa distrukturkan"
 
 
+def test_structuring_direct_another_document_type_is_400(client, auth):
+    response = _direct(client, auth, PAGES, document_type="npwp")
+
+    assert response.status_code == 400
+    assert response.json()["message"] == "Unsupported document_type: npwp. Supported: ['slip_gaji']"
+
+
 def test_validation_error_uses_envelope_with_code(client, auth):
-    response = client.post("/v1/structuring/structure", json={"pages": "not-a-list"}, headers=auth)
+    response = client.post("/v1/structuring-direct", json={"pages": PAGES}, headers=auth)
 
     assert response.status_code == 422
     body = response.json()
     assert body["errors"] == "VALIDATION_ERROR"
-    assert body["message"].startswith("body.pages:")
+    assert body["message"].startswith("body.ocr:")
 
 
 def test_requires_api_key(client):
-    assert client.post("/v1/structuring/structure", json={"pages": PAGES}).status_code == 401
+    assert client.post("/v1/structuring-direct", json={"ocr": {"pages": PAGES}}).status_code == 401

@@ -1,21 +1,11 @@
+import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from ocr_common.pipeline.schemas import GuardrailsPayload, SlipPayload
+from ocr_common.pipeline.schemas import GuardrailsPayload, StructuringPayload
+from ocr_common.thresholds import InvalidThreshold, parse_column_thresholds
 from ocr_common.web.schemas import JobStatusBase, SuccessEnvelope
-
-
-class ScoreRequest(BaseModel):
-    slips: list[SlipPayload] = Field(
-        ...,
-        min_length=1,
-        description=(
-            "Slip hasil tahap structuring, apa adanya. `source`, `checks`, `counts`, `llm.compare`, `ocr_text` "
-            "dan `ocr_confidence` harus ikut: fitur terkuat model justru berasal dari jejak itu — kesepakatan "
-            "regex vs LLM, jarak nominal ke median field, dan porsi kotak OCR berskor rendah di halaman"
-        ),
-    )
 
 
 class SlipScores(BaseModel):
@@ -44,12 +34,55 @@ class ScoringResult(BaseModel):
     column_confidence_threshold: dict[str, float] | None = Field(
         None,
         description="Ambang per field dari permintaan (`column_confidence_threshold`); null bila tidak dikirim",
-        examples=[{"gaji_bersih": 0.9, "all_field": 0.6}],
+        examples=[{"gaji_bersih": 0.9}],
     )
 
 
-class ScoreResponse(SuccessEnvelope):
-    data: ScoringResult
+class ScoringDirectRequest(BaseModel):
+    request_id: str | None = Field(None, description="Diulang di respons; opsional", examples=["QC_1"])
+    document_type: str = Field("slip_gaji", description="Hanya `slip_gaji`", examples=["slip_gaji"])
+    guardrails: GuardrailsPayload | None = Field(
+        None, description="Laporan guardrail; opsional, dikembalikan apa adanya"
+    )
+    structuring: StructuringPayload = Field(
+        ...,
+        description=(
+            "Hasil tahap structuring apa adanya (`data` dari `POST /v1/structuring-direct`). `source`, `checks`, "
+            "`counts`, `llm.compare`, `ocr_text` dan `ocr_confidence` tiap slip harus ikut: fitur terkuat model "
+            "berasal dari jejak itu"
+        ),
+    )
+    column_confidence_threshold: dict[str, float] | None = Field(
+        None,
+        description='Ambang per field (0-1), `{"all_field": 0.8}` atau `{"gaji_bersih": 0.9}`; kunci field menang',
+        examples=[{"all_field": 0.8}],
+    )
+
+    @field_validator("column_confidence_threshold", mode="before")
+    @classmethod
+    def _columns(cls, value: Any) -> dict[str, float] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError("column_confidence_threshold must be a JSON object")
+        try:
+            return parse_column_thresholds(json.dumps(value))
+        except InvalidThreshold as exc:
+            raise ValueError(str(exc)) from exc
+
+
+class ScoringDirectResult(ScoringResult):
+    data: dict[str, Any] = Field(
+        ...,
+        description=(
+            "Kontrak `extract-ocr`: `{total_slip, slip[]}`, tiap field `{value, confidence 0/1}` menurut "
+            "`column_confidence_threshold`, lalu `FIELD_CONFIDENCE_THRESHOLD`"
+        ),
+    )
+
+
+class ScoringDirectResponse(SuccessEnvelope):
+    data: ScoringDirectResult
 
 
 class ScoringJobRequest(BaseModel):
@@ -63,7 +96,7 @@ class ScoringJobRequest(BaseModel):
         None,
         description=(
             "Hasil tahap structuring. Boleh dihilangkan bila `PIPELINE_HANDOFF_BY_REFERENCE` menyala: service "
-            "ini membacanya dari `structuring_results` memakai request_id"
+            "ini membacanya dari `nilam_structuring_results` memakai request_id"
         ),
     )
     pipeline_name_sequence: list[str] | None = Field(

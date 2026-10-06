@@ -1,7 +1,3 @@
-import json
-
-import pytest
-
 from ocr_common.slip_gaji import SLIP_FIELDS, contract_data
 
 from app.config import get_settings
@@ -83,26 +79,13 @@ def test_missing_mandatory_fields_are_derived_from_the_values_themselves():
     assert data["slip"][0]["missing_mandatory_fields"] == ["nama_perusahaan", "periode"]
 
 
-@pytest.mark.parametrize("params", ['{"nik": "3123456711950001", "refno": "PK19039Y8U"}', '"halo"'])
-def test_params_are_returned_unchanged(client, auth, params):
-    response = _submit(client, auth, params=params)
+def test_params_are_accepted_and_ignored(client, auth, stub_extraction):
+    """Upstream 1 Oct 2026: `params` is no longer echoed; a client that still sends it is not refused."""
+    response = _submit(client, auth, params='{"nik": "3123456711950001"}')
 
     assert response.status_code == 200
-    assert response.json()["params"] == json.loads(params)
-
-
-@pytest.mark.parametrize("params", ["{not json", "[1, 2]", "42"])
-def test_invalid_params_are_422_before_anything_runs(client, auth, stub_extraction, params):
-    response = _submit(client, auth, params=params)
-
-    assert response.status_code == 422
-    body = response.json()
-    assert (body["errors"], body["message"]) == (
-        "INVALID_PARAMS",
-        "params must be valid JSON: an object, or a quoted string",
-    )
-    assert body["pipeline_last_stage"] == "orchestrator"
-    assert stub_extraction.submitted == []
+    assert "params" not in response.json()
+    assert len(stub_extraction.submitted) == 1
 
 
 def test_unsupported_document_type_is_400_before_anything_runs(client, auth, stub_extraction):

@@ -6,10 +6,10 @@ asyncio_default_fixture_loop_scope = "function"
 
 [tool.ty.environment]
 root = ["."]
-extra-paths = [".", "../../libs/ocr_common"]
+extra-paths = [".", "../../libs/ocr_common", "../../libs/slip_ml"]
 
 [tool.pyrefly]
-search-path = [".", "../../libs/ocr_common"]
+search-path = [".", "../../libs/ocr_common", "../../libs/slip_ml"]
 
 [tool.pyrefly.errors]
 # Pydantic models narrow a field in a subclass (`stage: Literal["OCR"]` over `stage: str`); that is the

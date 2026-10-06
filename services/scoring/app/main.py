@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from ocr_common.pipeline.schemas import ScoringStageCallback
 from ocr_common.web.app import add_stage_callback_webhook, create_app, database_readiness
 
-from app.api import jobs, scoring, testing
+from app.api import direct, jobs, testing
 from app.config import get_settings
 from app.dependencies import (
     get_confidence_model,
@@ -69,15 +69,19 @@ app = create_app(
         "di kontrak `extract-ocr`, supaya ambangnya bisa diubah tanpa melatih ulang apa pun.\n\n"
         "**Pipeline asinkron:** service structuring POST /v1/scoring/jobs dan menerima 202; service ini "
         "memberi skor di latar, menyimpan hasilnya, dan mengirim callback berisi hasil akhir ke orchestrator. "
-        "/v1/scoring/score melakukan pekerjaan yang sama secara sinkron. Semua endpoint kecuali /health "
+        "/v1/scoring-direct menjalankan model yang sama secara sinkron atas hasil structuring, untuk menguji "
+        "tahap ini saja (QC); tidak ada yang dicatat. Semua endpoint kecuali /health "
         "memerlukan header X-API-Key."
     ),
     tags=[
         {"name": "Pipeline", "description": "Tahap pipeline asinkron: 202, kerja di latar, callback"},
         {"name": "Callbacks", "description": "Permintaan yang DIKIRIM service ini ke orchestrator (lihat Webhooks)"},
-        {"name": "Scoring", "description": "Skor keyakinan per field, sinkron"},
+        {
+            "name": "Direct",
+            "description": "Tahap ini saja atas keluaran tahap sebelumnya, sinkron: tidak ada yang dicatat (QC)",
+        },
     ],
-    routers=[jobs.router, scoring.router, *([testing.router] if settings.testing_endpoints else [])],
+    routers=[jobs.router, direct.router, *([testing.router] if settings.testing_endpoints else [])],
     backends={
         "scoring": settings.scoring_backend,
         "storage": "postgres" if settings.database_url else "memory",

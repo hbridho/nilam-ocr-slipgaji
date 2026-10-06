@@ -34,7 +34,7 @@ SLIP = {
 }
 
 
-def test_scores_are_on_the_0_100_scale_and_skip_empty_fields():
+def test_scores_are_on_the_0_1_scale_and_skip_empty_fields():
     result = ConfidenceService(MockConfidenceModel(), 0.5).score({"slips": [SLIP]})
 
     scores = result["slips"][0]["scores"]
@@ -52,24 +52,55 @@ def test_the_service_makes_no_decision():
     assert all(set(entry) == {"slip_no", "scores"} for entry in result["slips"])
 
 
-def test_http_score_returns_a_score_per_slip(client, auth):
-    response = client.post("/v1/scoring/score", json={"slips": [SLIP]}, headers=auth)
+def _direct(client, auth, **body):
+    return client.post("/v1/scoring-direct", json={"structuring": {"slips": [SLIP]}, **body}, headers=auth)
+
+
+def test_scoring_direct_scores_a_structured_document_and_records_nothing(client, auth):
+    response = _direct(client, auth, request_id="QC_1")
 
     assert response.status_code == 200
-    data = response.json()["data"]
+    body = response.json()
+    assert body["request_id"] == "QC_1"
+    data = body["data"]
     assert data["slips"][0]["slip_no"] == 1
-    assert data["slips"][0]["scores"]["gaji_pokok"] > 0
+    assert 0 < data["slips"][0]["scores"]["gaji_pokok"] <= 1
+    [slip] = data["data"]["slip"]
+    assert slip["gaji_pokok"]["value"] == 4500000
+    assert slip["gaji_pokok"]["confidence"] == int(data["slips"][0]["scores"]["gaji_pokok"] >= 0.5)
+    assert client.get("/v1/scoring/jobs/QC_1", headers=auth).status_code == 404
 
 
-def test_http_score_without_slips_is_422(client, auth):
-    response = client.post("/v1/scoring/score", json={"slips": []}, headers=auth)
+def test_scoring_direct_column_threshold_decides_the_0_1_confidences(client, auth):
+    data = _direct(client, auth, column_confidence_threshold={"all_field": 1}).json()["data"]
+
+    assert all(field["confidence"] == 0 for field in data["data"]["slip"][0].values() if isinstance(field, dict))
+    assert data["column_confidence_threshold"]["gaji_pokok"] == 1.0, "all_field disebar ke setiap field"
+
+
+def test_scoring_direct_another_document_type_is_400(client, auth):
+    response = _direct(client, auth, document_type="npwp")
+
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"structuring": {"slips": "x"}},
+        {"structuring": {"slips": [SLIP]}, "column_confidence_threshold": {"nomor_npwp": 0.9}},
+    ],
+)
+def test_scoring_direct_bad_body_or_unknown_threshold_key_is_422(client, auth, body):
+    response = client.post("/v1/scoring-direct", json=body, headers=auth)
 
     assert response.status_code == 422
     assert response.json()["errors"] == "VALIDATION_ERROR"
 
 
 def test_requires_api_key(client):
-    assert client.post("/v1/scoring/score", json={"slips": [SLIP]}).status_code == 401
+    assert client.post("/v1/scoring-direct", json={"structuring": {"slips": [SLIP]}}).status_code == 401
 
 
 # --- model yang benar-benar dikirim ------------------------------------------------------

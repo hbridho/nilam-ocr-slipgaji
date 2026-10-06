@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from ocr_common.clients.remote import RemoteModelClient
+from ocr_common.slip_gaji import SLIP_FIELDS
 
 from app.clients.extraction import ExtractionJobClient
 from app.dependencies import get_extraction_client
@@ -133,8 +134,9 @@ def test_the_sequence_and_thresholds_travel_normalised(client, auth, extraction)
     [sent] = handler.requests
     fields, file_bytes = _form(sent)
     assert json.loads(fields["pipeline_name_sequence"]) == ["guardrails", "extraction", "structuring", "scoring"]
-    assert json.loads(fields["guardrails_confidence_threshold"]) == {"identity": {"value": 0.8, "target": "accept"}}
-    assert json.loads(fields["column_confidence_threshold"]) == {"all_field": 0.6}
+    assert json.loads(fields["guardrails_confidence_threshold"]) == {"identity": 0.8}
+    # all_field is spread over every slip field at the entry point (upstream 57cc691).
+    assert json.loads(fields["column_confidence_threshold"]) == dict.fromkeys(SLIP_FIELDS, 0.6)
     assert (fields["request_id"], file_bytes) == (RID, JPEG)
 
 

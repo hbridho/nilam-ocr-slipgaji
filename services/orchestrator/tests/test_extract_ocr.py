@@ -20,7 +20,6 @@ ENVELOPE = {
     "request_id",
     "guardrails",
     "pipeline_last_stage",
-    "params",
 }
 
 
@@ -70,12 +69,7 @@ def test_extract_ocr_follows_the_spec_envelope(client, auth, stub_extraction):
     assert set(body) == ENVELOPE
     assert (body["status_code"], body["status_desc"]) == (200, "OK")
     assert body["message"] == "OCR extraction completed successfully"
-    assert (body["guardrails"], body["errors"], body["params"], body["pipeline_last_stage"]) == (
-        0,
-        None,
-        None,
-        "scoring",
-    )
+    assert (body["guardrails"], body["errors"], body["pipeline_last_stage"]) == (0, None, None)
     assert body["data"]["total_slip"] == 2
     assert body["data"]["slip"][0]["periode"] == {"value": "2025-02", "confidence": 1}
 
@@ -108,8 +102,8 @@ def test_all_field_sets_every_field_not_named(client, auth):
 
 
 def test_guardrails_threshold_is_normalised_and_handed_to_the_ocr_stage(client, auth, stub_extraction):
-    _submit(client, auth, guardrails_confidence_threshold="0.8", guardrails_tendency="rejected")
-    assert stub_extraction.submitted[0]["guardrail_thresholds"] == {"identity": {"value": 0.8, "target": "reject"}}
+    _submit(client, auth, guardrails_confidence_threshold='{"acc_rej": 0.8, "blur": 0.6}')
+    assert stub_extraction.submitted[0]["guardrail_thresholds"] == {"identity": 0.8, "blur": 0.6}
 
 
 @pytest.mark.parametrize(
@@ -117,7 +111,7 @@ def test_guardrails_threshold_is_normalised_and_handed_to_the_ocr_stage(client, 
     [
         {"guardrails_confidence_threshold": "1.5"},
         {"guardrails_confidence_threshold": '{"blank": 0.5}'},
-        {"guardrails_tendency": "accepted"},
+        {"guardrails_confidence_threshold": "0.8"},
         {"column_confidence_threshold": '{"nomor_npwp": 0.9}'},
         {"column_confidence_threshold": "not json"},
     ],
@@ -175,7 +169,7 @@ def test_guardrails_only_answers_the_guardrail_report(client, auth, stub_waiter)
 
     assert response.status_code == 200
     body = response.json()
-    assert (body["pipeline_last_stage"], body["guardrails"]) == ("guardrails", 0)
+    assert (body["pipeline_last_stage"], body["guardrails"]) == (None, 0), "success: no pipeline_last_stage"
     assert body["data"]["passed"] is True
     assert body["data"]["document"] == ACCEPTED_REPORT["document"]
     assert stub_waiter.sequences == [["guardrails"]]
@@ -186,7 +180,7 @@ def test_extraction_only_answers_the_ocr_result(client, auth, stub_waiter):
 
     body = _submit(client, auth, pipeline_name_sequence='["extraction"]').json()
 
-    assert body["pipeline_last_stage"] == "extraction"
+    assert body["pipeline_last_stage"] is None
     assert set(body["data"]) == {"engine", "model", "elapsed_ms", "n_pages", "full_text", "pages"}
 
 
@@ -197,7 +191,7 @@ def test_ending_at_structuring_answers_the_structured_fields(client, auth, stub_
 
     body = _submit(client, auth, pipeline_name_sequence='["extraction","structuring"]').json()
 
-    assert body["pipeline_last_stage"] == "structuring"
+    assert body["pipeline_last_stage"] is None
     assert body["data"]["total_slip"] == 2
     assert body["data"]["slips"][0]["fields"]["gaji_pokok"] == 4500000
 
@@ -220,15 +214,6 @@ def test_rejection_by_the_structuring_rules_is_400_from_structuring(client, auth
     body = _submit(client, auth).json()
 
     assert (body["status_code"], body["guardrails"], body["pipeline_last_stage"]) == (400, 1, "structuring")
-
-
-def test_params_are_echoed_and_bad_params_are_422(client, auth, stub_extraction):
-    ok = _submit(client, auth, params='{"refno": "PK1"}').json()
-    bad = _submit(client, auth, params="{not json").json()
-
-    assert ok["params"] == {"refno": "PK1"}
-    assert (bad["status_code"], bad["errors"], bad["pipeline_last_stage"]) == (422, "INVALID_PARAMS", "orchestrator")
-    assert len(stub_extraction.submitted) == 1
 
 
 def test_unsupported_document_type_is_400(client, auth, stub_extraction):
