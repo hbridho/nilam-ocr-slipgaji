@@ -1,8 +1,8 @@
 # nilam-ocr-slipgaji
 
 Layanan OCR **slip gaji** untuk NILAM (BRIBrain). Berkas slip gaji masuk, keluar 20 field per slip
-beserta `confidence` 0/1. (envelope, `pipeline_name_sequence`, threshold 0–1, kode error, callback), 
-dengan `data` berbentuk slip gaji (satu berkas bisa berisi beberapa slip).
+beserta `confidence` 0/1. Kontraknya mengikuti **API spec [07] NPWP** (envelope, `pipeline_name_sequence`,
+threshold 0–1, kode error, callback), dengan `data` berbentuk slip gaji (satu berkas bisa berisi beberapa slip).
 
 ## Service
 
@@ -59,7 +59,7 @@ flowchart TD
     O -.->|GET status| E & S & SC
 ```
 
-**Guardrail berjalan SETELAH OCR**, modelnya membaca teks OCR (AUC 0,911)
+**Guardrail berjalan SETELAH OCR**, bukan sebelumnya seperti NPWP: modelnya membaca teks OCR (AUC 0,911)
 dan bukan piksel (0,638). Di kontrak, namanya tetap `guardrails` dan penolakannya dilaporkan
 `pipeline_last_stage: guardrails`.
 
@@ -72,16 +72,23 @@ dan bukan piksel (0,638). Di kontrak, namanya tetap `guardrails` dan penolakanny
 |---|---|
 | Mematikan satu guardrail | `GUARDRAIL_<BLANK\|BLUR\|IDENTITY>_ENABLED=false` di extraction, atau Helm `--set services.guardrail-blur.enabled=false`. Guardrail yang mati/tidak menjawab dilewati (`GUARDRAILS_FAIL_OPEN=true`) dan tercatat di laporan. |
 | Penyedia LLM | `LLM_BACKEND=bedrock\|http\|off`, `LLM_ENDPOINT`, `LLM_MODEL` (structuring). Penyedia lain: `register_chat_backend()` |
-| Prompt LLM | Terpisah dari kode: `services/structuring/prompts/slip_gaji.v1.md` (bawaan), `PROMPT_PATH` (ConfigMap), atau `PROMPT_SOURCE=db` → tabel `prompts` |
+| Prompt LLM | Terpisah dari kode: `services/structuring/prompts/slip_gaji.v1.md` (bawaan), `PROMPT_PATH` (volume), atau `PROMPT_SOURCE=db` → tabel `nilam_ocr_slipgaji.system_prompt` (baris `is_active`) |
 | Mesin OCR | `EXTRACTION_BACKEND=api\|rapidocr\|mock`, `EXTRACTION_OCR_URL` |
-| Ambang | Per permintaan: `guardrails_confidence_threshold` + `guardrails_tendency`, `column_confidence_threshold`. Bawaan: `FIELD_CONFIDENCE_THRESHOLD=0.5` |
+| Ambang | Per permintaan, sisi accept: `guardrails_confidence_threshold` = `{"acc_rej": 0.8}` (atau `identity`/`blur`), `column_confidence_threshold` = `{"all_field": 0.6, "gaji_bersih": 0.9}`. Bawaan: ambang tiap guardrail, `FIELD_CONFIDENCE_THRESHOLD=0.5` |
+| Model | JSON di dalam image, atau dari GCS saat start: `<SERVICE>_MODEL_GCS_URI` (bucket `gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/`, folder unggah dari `scripts/export_gcs_models.py`) |
+| Basis data | Cloud SQL `nilam` lewat `CLOUDSQL_*` (seperti nilam-ocr-shm; aplikasi Entra → WIF), skema `nilam_ocr_slipgaji`; atau `DATABASE_URL` untuk Postgres lokal |
+| Observability | Elastic APM bila `ELASTIC_APM_SERVER_URL` diisi (nama `ms-bribrain-nilam-ocr-slipgaji-<service>`); `/metrics` Prometheus |
 
 ## Dokumen lain
 
 - [integration.md](integration.md): kontrak API untuk Orkestrasi pusat (format [07]).
 - [api/gateway.openapi.yaml](api/gateway.openapi.yaml): OpenAPI gabungan; tiap service juga punya `/docs`.
 - [ARSITEKTUR.md](ARSITEKTUR.md): isi tiap service dan alasan desainnya.
-- [deploy/DEPLOY.md](deploy/DEPLOY.md): runbook deploy ke GKE untuk tim deploy.
+- [deploy/vm/README.md](deploy/vm/README.md): deploy dev, **VM `gc-bribrain-dev-gce-facematch-01` dengan Docker**.
+- [deploy/vm/vm.env.example](deploy/vm/vm.env.example): **satu `.env` untuk seluruh alur** (handover), urut dari pintu
+  masuk sampai Cloud SQL dan Orkestrasi; rahasia dikosongkan.
+- [deploy/DEPLOY.md](deploy/DEPLOY.md): build image, Secret, migrasi, dan Helm untuk GKE (setara nilam-ocr-npwp).
+- [db/README.md](db/README.md): skema `nilam_ocr_slipgaji`, migrasi, pindah ke Cloud SQL.
 
 ## Menjalankan di lokal
 
@@ -102,5 +109,5 @@ make test lint typecheck      # pytest per service, ruff, ty
 python scripts/regen_openapi.py
 ```
 
-CI (`.github/workflows/ci.yml`): lint + tes, migrasi Postgres, build dan health check ketujuh image, render
+CI (`.github/workflows/ci.yml`): lint + tes, migrasi Postgres (termasuk pemindahan ke `nilam_ocr_slipgaji` dan salin ke Cloud SQL), build dan health check ketujuh image, render
 Helm chart (termasuk tiap guardrail dimatikan).

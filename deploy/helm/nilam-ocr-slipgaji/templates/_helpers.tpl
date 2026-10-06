@@ -84,6 +84,8 @@ URL antar service menunjuk ke Service per komponen (<release>-<nama>).
 {{- $_ := set $env "ORCHESTRATION_CALLBACK_PATH" $root.Values.orchestration.callbackPath }}
 {{- $_ := set $env "ORCHESTRATION_TIMEOUT_SECONDS" ($root.Values.orchestration.timeoutSeconds | toString) }}
 {{- $_ := set $env "ORCHESTRATION_CALLBACK_FORMAT" ($root.Values.orchestration.callbackFormat | default "stage") }}
+{{- $_ := set $env "ORCHESTRATION_CALLBACK_ENABLED" (ternary "false" "true" (eq (toString $root.Values.orchestration.callbackEnabled) "false")) }}
+{{- $_ := set $env "ORCHESTRATION_CALLBACK_MAX_AGE_SECONDS" ($root.Values.orchestration.callbackMaxAgeSeconds | default "600" | toString) }}
 {{- end }}
 {{- range $svc.upstreams }}
 {{- $upstream := index $root.Values.services . }}
@@ -111,6 +113,24 @@ mencatatnya di `skipped`. Jadi mematikan satu guardrail cukup satu `--set`, tanp
 {{- end }}
 {{- else if $upstream.enabledEnv }}
 {{- $_ := set $env $upstream.enabledEnv "false" }}
+{{- end }}
+{{- end }}
+{{- if and $svc.gcsModels $root.Values.gcpWif.clientId }}
+{{- with $root.Values.gcpWif }}
+{{- $_ := set $env "AZURE_TENANT_ID" .tenantId }}
+{{- $_ := set $env "AZURE_CLIENT_ID" .clientId }}
+{{- $_ := set $env "GCP_PROJECT_NUMBER" (.projectNumber | toString) }}
+{{- $_ := set $env "GCP_POOL_ID" .poolId }}
+{{- $_ := set $env "GCP_PROVIDER_ID" .providerId }}
+{{- $_ := set $env "GCP_SERVICE_ACCOUNT_EMAIL" .serviceAccountEmail }}
+{{- end }}
+{{- end }}
+{{- with $root.Values.apm }}
+{{- if .serverUrl }}
+{{- $_ := set $env "ELASTIC_APM_SERVER_URL" .serverUrl }}
+{{- $_ := set $env "ELASTIC_APM_ENVIRONMENT" (.environment | default $root.Values.environment) }}
+{{- $_ := set $env "ELASTIC_APM_TRANSACTION_SAMPLE_RATE" (.transactionSampleRate | default "1.0" | toString) }}
+{{- $_ := set $env "ELASTIC_APM_VERIFY_SERVER_CERT" (ternary "false" "true" (eq (toString .verifyServerCert) "false")) }}
 {{- end }}
 {{- end }}
 {{- range $key, $value := $root.Values.commonEnv }}

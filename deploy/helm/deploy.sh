@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHART="$ROOT/deploy/helm/nilam-ocr-slipgaji"
-DEPLOY_ENV="${DEPLOY_ENV:-dev}"
+DEPLOY_ENV="${DEPLOY_ENV:-ddb-dev}"
 VALUES="$CHART/values-$DEPLOY_ENV.yaml"
 RELEASE="${RELEASE:-nilam-ocr-slipgaji}"
 NAMESPACE="${NAMESPACE:-nilam-ocr-slipgaji}"
@@ -43,7 +43,7 @@ Opsi:
   -y, --yes       tanpa konfirmasi
   -h, --help      tampilkan bantuan ini
 
-Environment: DEPLOY_ENV (default dev -> values-dev.yaml), RELEASE, NAMESPACE,
+Environment: DEPLOY_ENV (default ddb-dev -> values-ddb-dev.yaml), RELEASE, NAMESPACE,
 REGISTRY, EXPECTED_CONTEXT, TIMEOUT (default 10m), HISTORY_MAX (revisi release yang disimpan
 untuk rollback, default 5).
 

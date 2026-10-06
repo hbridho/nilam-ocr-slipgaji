@@ -1,0 +1,170 @@
+"""CI check of migration 0010: a database at 0009, with its rows and its version table in `public`, ends up with
+every table and every row in `nilam_ocr_slipgaji` under the `nilam_` names plus the empty `system_prompt`, keeps
+counting its ids where it left off, and survives a downgrade and an upgrade again.
+
+    DATABASE_URL=postgresql+asyncpg://... python db/check_schema_move.py   # an EMPTY database: it is rebuilt
+"""
+
+import asyncio
+import os
+import subprocess
+import sys
+
+import asyncpg
+
+ALEMBIC = [sys.executable, "-m", "alembic", "-c", os.path.join(os.path.dirname(__file__), "alembic.ini")]
+SCHEMA = "nilam_ocr_slipgaji"
+PREFIX = "nilam_"
+VERSION_TABLE = "nilam_ocr_slipgaji_alembic_version"
+OLD_VERSION_TABLE = "ocr_slip_gaji_alembic_version"
+# Created by 0010 in the team's DDL, without the `nilam_` prefix.
+SYSTEM_PROMPT = "system_prompt"
+# The names before 0010; from 0010 on each one carries PREFIX.
+TABLES = [
+    f"{lane}{name}"
+    for lane in ("", "testing_")
+    for name in (
+        *(f"{stage}_{kind}" for stage in ("ocr", "structuring", "scoring") for kind in ("jobs", "results")),
+        "pipeline_outbox",
+        "guardrails_results",
+    )
+]
+NEW_TABLES = [f"{PREFIX}{table}" for table in TABLES]
+
+
+def alembic(*args: str) -> None:
+    subprocess.run([*ALEMBIC, *args], check=True)
+
+
+async def connect() -> asyncpg.Connection:
+    return await asyncpg.connect(os.environ["DATABASE_URL"].replace("+asyncpg", ""))
+
+
+async def tables_in(conn: asyncpg.Connection, schema: str) -> set[str]:
+    rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = $1", schema)
+    return {row["tablename"] for row in rows}
+
+
+async def put_version_table(conn: asyncpg.Connection, schema: str) -> None:
+    """Puts the version table where, and under the name, the migration image of an older revision kept it."""
+    await conn.execute(f"ALTER TABLE {SCHEMA}.{VERSION_TABLE} SET SCHEMA {schema}")
+    await conn.execute(f"ALTER TABLE {schema}.{VERSION_TABLE} RENAME TO {OLD_VERSION_TABLE}")
+    await conn.execute(f"ALTER INDEX {schema}.{VERSION_TABLE}_pkc RENAME TO {OLD_VERSION_TABLE}_pkc")
+
+
+async def seed(conn: asyncpg.Connection) -> None:
+    for lane in ("", "testing_"):
+        for stage in ("ocr", "structuring", "scoring"):
+            await conn.execute(
+                f"INSERT INTO public.{lane}{stage}_jobs (request_id, status, input, ds) "
+                "VALUES ('REQ_1', 'DONE', '{\"document_type\": \"slip_gaji\"}', '20260930'), "
+                "('REQ_2', 'FAILED', NULL, '20260930')"
+            )
+            await conn.execute(
+                f"INSERT INTO public.{lane}{stage}_results (request_id, result, ds) "
+                "VALUES ('REQ_1', '{\"ok\": 1}', '20260930')"
+            )
+        await conn.execute(
+            f"INSERT INTO public.{lane}pipeline_outbox (request_id, stage, kind, payload, ds) "
+            "VALUES ('REQ_1', 'OCR', 'handoff', '{}', '20260930'), ('REQ_2', 'OCR', 'callback', '{}', '20260930')"
+        )
+        await conn.execute(
+            f"INSERT INTO public.{lane}guardrails_results (request_id, passed, threshold_source, report, ds) "
+            "VALUES ('REQ_1', true, 'service', '{}', '20260930')"
+        )
+
+
+async def counts(conn: asyncpg.Connection, schema: str, prefix: str = "") -> dict[str, int]:
+    """Rows per table, keyed by the name before 0010 whatever the table is called in `schema`."""
+    return {table: int(await conn.fetchval(f'SELECT count(*) FROM "{schema}"."{prefix}{table}"')) for table in TABLES}
+
+
+async def check_head(before: dict[str, int]) -> None:
+    alembic("upgrade", "head")
+    alembic("check")
+    conn = await connect()
+    try:
+        old_names = set(TABLES) | set(NEW_TABLES) | {VERSION_TABLE, OLD_VERSION_TABLE}
+        assert not old_names & await tables_in(conn, "public"), "tables left in public"
+        assert await tables_in(conn, SCHEMA) == set(NEW_TABLES) | {VERSION_TABLE, SYSTEM_PROMPT}
+        assert await counts(conn, SCHEMA, PREFIX) == before, "rows lost in the move"
+        # The id sequences moved and were renamed with their tables, and carry on after the rows already there.
+        sequence = await conn.fetchval(f"SELECT pg_get_serial_sequence('{SCHEMA}.{PREFIX}pipeline_outbox', 'id')")
+        assert sequence == f"{SCHEMA}.{PREFIX}pipeline_outbox_id_seq", sequence
+        last_id = await conn.fetchval(f"SELECT max(id) FROM {SCHEMA}.{PREFIX}pipeline_outbox")
+        new_id = await conn.fetchval(
+            f"INSERT INTO {SCHEMA}.{PREFIX}pipeline_outbox (request_id, stage, kind, payload, ds) "
+            "VALUES ('REQ_3', 'OCR', 'handoff', '{}', '20260930') RETURNING id"
+        )
+        assert new_id > last_id, (new_id, last_id)
+        await conn.execute(f"DELETE FROM {SCHEMA}.{PREFIX}pipeline_outbox WHERE request_id = 'REQ_3'")
+        # Every index, constraint and sequence is named after the table it now belongs to.
+        stale = await conn.fetch(
+            "SELECT relname FROM pg_class WHERE relnamespace = $1::regnamespace AND relkind IN ('i', 'S') "
+            "AND strpos(relname, $2) = 0 AND strpos(relname, $3) = 0",
+            SCHEMA,
+            PREFIX,
+            SYSTEM_PROMPT,
+        )
+        assert not stale, [row["relname"] for row in stale]
+        constraints = await conn.fetch(
+            "SELECT conname FROM pg_constraint WHERE connamespace = $1::regnamespace AND strpos(conname, $2) <> 1 "
+            "AND strpos(conname, $3) = 0",
+            SCHEMA,
+            PREFIX,
+            SYSTEM_PROMPT,
+        )
+        # system_prompt as the team agreed: at most one active row.
+        await conn.execute(f"INSERT INTO {SCHEMA}.{SYSTEM_PROMPT} (system_prompt, is_active) VALUES ('a', TRUE)")
+        try:
+            await conn.execute(f"INSERT INTO {SCHEMA}.{SYSTEM_PROMPT} (system_prompt, is_active) VALUES ('b', TRUE)")
+        except asyncpg.UniqueViolationError:
+            pass
+        else:
+            raise AssertionError("system_prompt took a second active row")
+        await conn.execute(f"DELETE FROM {SCHEMA}.{SYSTEM_PROMPT}")
+        assert not constraints, [row["conname"] for row in constraints]
+        # The foreign key moved too: a result without its job is still refused.
+        try:
+            await conn.execute(
+                f"INSERT INTO {SCHEMA}.{PREFIX}ocr_results (request_id, result, ds) VALUES ('NOPE', '{{}}', '')"
+            )
+        except asyncpg.ForeignKeyViolationError:
+            pass
+        else:
+            raise AssertionError("nilam_ocr_results lost its foreign key to nilam_ocr_jobs")
+    finally:
+        await conn.close()
+
+
+async def downgrade_to(revision: str, schema: str, version_schema: str | None, before: dict[str, int]) -> None:
+    """Downgrades to `revision`, checks the rows are back in `schema` under the old names, and puts the version
+    table where that revision's image kept it (`None`: where env.py keeps it now)."""
+    alembic("downgrade", revision)
+    conn = await connect()
+    try:
+        assert await counts(conn, schema) == before, f"rows lost moving back to {schema}"
+        if version_schema:
+            await put_version_table(conn, version_schema)
+    finally:
+        await conn.close()
+
+
+async def main() -> None:
+    alembic("upgrade", "0009_guardrails_results_sequence")
+    conn = await connect()
+    try:
+        assert set(TABLES) <= await tables_in(conn, "public"), "0009 should leave the tables in public"
+        await put_version_table(conn, "public")  # where the migration image up to 0009 kept it
+        await seed(conn)
+        before = await counts(conn, "public")
+    finally:
+        await conn.close()
+
+    await check_head(before)
+    await downgrade_to("0009_guardrails_results_sequence", "public", None, before)
+    await check_head(before)
+    print(f"0010 moves every table and row from public to {SCHEMA} under {PREFIX}*, adds {SYSTEM_PROMPT}, and back")
+
+
+asyncio.run(main())

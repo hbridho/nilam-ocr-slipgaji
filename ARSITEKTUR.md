@@ -161,7 +161,8 @@ bukan `blur`: yang kurang permintaannya, bukan fotonya.
 model `guard_text.json`.
 
 **Yang bisa diganti.** Ambangnya, dan ini satu-satunya guardrail yang menerima ambang **milik
-Orkestrasi pusat** (`IDENTITY_THRESHOLD_URL`, di-cache 60 s) — karena hanya skor inilah yang
+Orkestrasi pusat** (`IDENTITY_THRESHOLD_URL` menjawab `{"threshold": x}` seperti NPWP, di-cache 60 s; per
+permintaan `guardrails_confidence_threshold={"acc_rej": x}`) — karena hanya skor inilah yang
 berarti P(slip gaji). Dua yang lain tidak, dan tidak seharusnya.
 
 ### structuring :8032
@@ -237,7 +238,6 @@ Prompt **tidak pernah ada di dalam setelan**. Yang ada penunjuknya:
 
 ```bash
 PROMPT_SOURCE=file
-PROMPT_NAME=slip_gaji
 PROMPT_VERSION=1
 PROMPT_PATH=/etc/prompts/slip_gaji.v2.md    # boleh absolut -> ConfigMap / volume
 ```
@@ -246,8 +246,9 @@ Bawaannya `services/structuring/prompts/slip_gaji.v1.md`, di luar kode, disalin 
 mengganti prompt bisa dilakukan dengan memasang volume — tanpa rebuild.
 
 **Basis data sudah tersedia**: structuring mendaftarkan resolver `db` sendiri (`app/prompts.py`).
-`PROMPT_SOURCE=db` membaca tabel `prompts` (migrasi 0010) — `PROMPT_VERSION` kosong berarti baris
-`active` terbaru — sekali saat start. Basis data tidak terbaca → kembali ke `PROMPT_PATH` dengan
+`PROMPT_SOURCE=db` membaca tabel `nilam_ocr_slipgaji.system_prompt` (DDL yang disepakati tim untuk semua
+dokumen NILAM, migrasi 0010): `PROMPT_VERSION` kosong berarti baris `is_active = TRUE` (indeks unik menjamin
+paling banyak satu), angka berarti kolom `version` — sekali saat start. Basis data tidak terbaca → kembali ke `PROMPT_PATH` dengan
 peringatan (`PROMPT_DB_FALLBACK_TO_FILE=true`), atau menolak start bila `false`. Teks prompt sengaja tidak ditaruh di `config.yaml` justru supaya
 perpindahan ini bukan penulisan ulang berkas setelan — dan supaya setiap suntingan prompt tidak
 masuk ke riwayat yang sama dengan DPI dan pilihan model. Dua hal yang berubah karena alasan
@@ -266,13 +267,21 @@ Semua model di jalur sajian adalah **JSON di dalam `libs/slip_ml`** — `guard_q
 `guard_text.json`, `conf.json`. Tidak ada torch, sklearn, pickle, atau OpenCV di image mana pun;
 penyajiannya numpy saja. Memperbarui model berarti mengganti satu berkas JSON.
 
+Model yang sama bisa dibaca dari **GCS** saat start, seperti NPWP: `<SERVICE>_MODEL_GCS_URI` menunjuk
+`gs://gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/<guardrails|scoring>/<model>/v<N>/<model>_v<N>.json`
+(tata letak folder SHM: satu folder per model dan versi, `manifest.json` di sebelahnya). Berkas diunduh ke
+`/tmp/models`, dicek MD5 / SHA-256, lalu loader `slip_ml` diarahkan ke sana (`slip_ml.models.use`) tanpa
+menyunting kode vendor. Unduhan gagal = service menolak start. Folder unggahnya dibuat
+`scripts/export_gcs_models.py`.
+
 ---
 
 ## 5 · Yang masih terbuka
 
 | Hal | Keadaan |
 |---|---|
-| **Layanan OCR di cluster** | `EXTRACTION_OCR_URL` harus terjangkau dari namespace; uji end-to-end lokal memakai OCR tiruan karena alamat itu tidak terjangkau dari laptop. |
+| **Target deploy** | Dev: VM `gc-bribrain-dev-gce-facematch-01` dengan Docker (`deploy/vm/`); Helm untuk GKE tetap setara NPWP. |
+| **Layanan OCR** | `EXTRACTION_OCR_URL` harus terjangkau dari VM / namespace; uji end-to-end lokal memakai OCR tiruan karena alamat itu tidak terjangkau dari laptop. |
 | **Batas halaman** | NPWP 2; slip gaji 12 (berkas tiga bulan lazim). Konfirmasi dengan Orkestrasi pusat. |
 | **`["guardrails"]` saja** | Menjalankan OCR dulu (guardrail membaca teks), jadi bisa 202 + callback, beda dengan NPWP yang selalu langsung. |
 | **Callback Orkestrasi** | URL, path, dan `X-Callback-Key` dari tim Orkestrasi; belum diuji ke service mereka. |

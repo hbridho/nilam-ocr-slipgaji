@@ -76,9 +76,9 @@ paths:
 
         |---|---|---|---|---|---|
 
-        | Selesai | 200 | hasil service terakhir | `0` | null | service terakhir |
+        | Selesai | 200 | hasil service terakhir | `0` | null | null |
 
-        | Masih berjalan | 202 | null | null | null | service yang sedang berjalan |
+        | Masih berjalan | 202 | null | null | null | null |
 
         | Ditahan guardrail | 400 | null | `1` | `DOWNSTREAM_VALIDATION_ERROR` | `guardrails` |
 
@@ -87,6 +87,11 @@ paths:
 
         | Sebuah tahap gagal | 422 | null | `0` | `OCR_FAILED` / `STRUCTURING_FAILED` / `SCORING_FAILED`
         | tahap itu |
+
+
+        Status HTTP (juga `status_code`) menyatakan keadaan permintaan: 200 selesai, 202 masih berjalan,
+        4xx / 5xx gagal atau ditolak. `pipeline_last_stage` null pada jawaban sukses (200, 202) dan menyebut
+        service asal galat, atau `orchestrator` bila ditolak pintu masuk sendiri.
 
 
         **`pipeline_name_sequence` (saklar service).** Urutan baku `guardrails -> extraction -> structuring
@@ -107,8 +112,15 @@ paths:
 
 
         **Confidence.** Setiap field `{value, confidence}`; `confidence` 1 ketika probabilitas model keyakinan
-        (0-1) >= ambang field itu (`column_confidence_threshold`, lalu `all_field`, lalu `FIELD_CONFIDENCE_THRESHOLD`
-        0,5), selain itu 0. Callback membawa probabilitas 0-1 mentahnya.
+        (0-1) >= ambang field itu, selain itu 0. Callback hasil membawa `data` yang sama persis.
+
+
+        **Ambang per permintaan, semuanya sisi accept (tanpa `guardrails_tendency`).** `guardrails_confidence_threshold`
+        = JSON object per guardrail: `{"acc_rej": 0.8}` (= `identity`, P(slip gaji)) dan/atau `{"blur":
+        0.7}` (P(terbaca) = 1 - p_broken), 0 < x < 1. Tidak dikirim: ambang bawaan tiap service guardrail.
+        `column_confidence_threshold` = JSON object per field; `all_field` disebar ke ke-20 field dan
+        kunci field sendiri menang. Field yang tidak disebut: `FIELD_CONFIDENCE_THRESHOLD` (0,5). Ambang
+        yang tidak terbaca atau kunci tak dikenal: 422 `INVALID_THRESHOLD`, tidak ada yang dijalankan.
 
 
         **Idempotensi.** request_id yang sama tidak menjalankan pipeline dua kali kecuali percobaan OCR
@@ -319,7 +331,6 @@ paths:
                         missing_mandatory_fields: []
                     request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
                     guardrails: 0
-                    pipeline_last_stage: scoring
                 guardrails_only:
                   summary: '`["guardrails"]`: laporan guardrail'
                   value:
@@ -333,7 +344,6 @@ paths:
                         confidence: 0.9934
                         n_pages: 1
                         threshold: 0.47
-                        threshold_target: accept
                       pages: []
                       checks:
                         blank:
@@ -348,7 +358,6 @@ paths:
                       unavailable: []
                     request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
                     guardrails: 0
-                    pipeline_last_stage: guardrails
         '202':
           description: Masih berjalan saat masa tunggu habis
           content:
@@ -363,7 +372,6 @@ paths:
                     status_desc: Accepted
                     message: OCR job accepted; still processing
                     request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
-                    pipeline_last_stage: structuring
         '400':
           description: 'Ditahan guardrail atau ditolak aturan structuring (`DOWNSTREAM_VALIDATION_ERROR`,
             `guardrails: 1`), `UNSUPPORTED_DOCUMENT_TYPE`, `EMPTY_FILE`, `UNSUPPORTED_FILE_TYPE`, `UNREADABLE_FILE`,
@@ -379,8 +387,8 @@ paths:
                 message: Dokumen ini bukan slip gaji. Mohon unggah slip gaji.
                 errors: DOWNSTREAM_VALIDATION_ERROR
                 request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
-                guardrails: 1
                 pipeline_last_stage: guardrails
+                guardrails: 1
         '401':
           description: Missing or invalid X-API-Key
           content:
@@ -407,9 +415,8 @@ paths:
                 errors: FILE_TOO_LARGE
                 pipeline_last_stage: orchestrator
         '422':
-          description: '`INVALID_PIPELINE_SEQUENCE`, `INVALID_THRESHOLD`, `INVALID_PARAMS`, `VALIDATION_ERROR`
-            (tidak ada yang dijalankan), atau sebuah tahap gagal: `OCR_FAILED`, `STRUCTURING_FAILED`,
-            `SCORING_FAILED`'
+          description: '`INVALID_PIPELINE_SEQUENCE`, `INVALID_THRESHOLD`, `VALIDATION_ERROR` (tidak ada
+            yang dijalankan), atau sebuah tahap gagal: `OCR_FAILED`, `STRUCTURING_FAILED`, `SCORING_FAILED`'
           content:
             application/json:
               schema:
@@ -492,9 +499,9 @@ paths:
 
         |---|---|---|---|---|---|
 
-        | Selesai | 200 | hasil service terakhir | `0` | null | service terakhir |
+        | Selesai | 200 | hasil service terakhir | `0` | null | null |
 
-        | Masih berjalan | 202 | null | null | null | service yang sedang berjalan |
+        | Masih berjalan | 202 | null | null | null | null |
 
         | Ditahan guardrail | 400 | null | `1` | `DOWNSTREAM_VALIDATION_ERROR` | `guardrails` |
 
@@ -505,8 +512,12 @@ paths:
         | tahap itu |
 
 
-        `params` selalu null di sini (tidak disimpan). **404** `REQUEST_ID_NOT_FOUND`: tidak ada job untuk
-        request_id ini.
+        Status HTTP (juga `status_code`) menyatakan keadaan permintaan: 200 selesai, 202 masih berjalan,
+        4xx / 5xx gagal atau ditolak. `pipeline_last_stage` null pada jawaban sukses (200, 202) dan menyebut
+        service asal galat, atau `orchestrator` bila ditolak pintu masuk sendiri.
+
+
+        **404** `REQUEST_ID_NOT_FOUND`: tidak ada job untuk request_id ini.
 
 
         **Batasan.** Penyerahan antar dua tahap yang gagal permanen membuat tahap berikutnya tidak punya
@@ -721,7 +732,6 @@ paths:
                         missing_mandatory_fields: []
                     request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
                     guardrails: 0
-                    pipeline_last_stage: scoring
         '202':
           description: Masih berjalan
           content:
@@ -734,7 +744,6 @@ paths:
                     status_desc: Accepted
                     message: OCR job accepted; still processing
                     request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
-                    pipeline_last_stage: structuring
               schema:
                 $ref: '#/components/schemas/ExtractOcrResponse'
         '400':
@@ -748,8 +757,8 @@ paths:
                 message: Dokumen ini bukan slip gaji. Mohon unggah slip gaji.
                 errors: DOWNSTREAM_VALIDATION_ERROR
                 request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
-                guardrails: 1
                 pipeline_last_stage: guardrails
+                guardrails: 1
               schema:
                 $ref: '#/components/schemas/ExtractOcrResponse'
         '401':
@@ -786,8 +795,8 @@ paths:
                 message: tidak ada teks OCR yang bisa distrukturkan
                 errors: STRUCTURING_FAILED
                 request_id: OCR_9cb01af2-493d-446d-b191-af120333f6d0
-                guardrails: 0
                 pipeline_last_stage: structuring
+                guardrails: 0
               schema:
                 $ref: '#/components/schemas/ExtractOcrResponse'
         '500':
@@ -939,14 +948,6 @@ components:
           description: URL this service fetches the document image from (e.g. a presigned MinIO GET).
             Omit when uploading file. The host must be listed in the service's `FILE_URL_ALLOWED_HOSTS`,
             or resolve to a public address when that is empty; redirects are not followed.
-        params:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Params
-          description: Metadata klien (JSON object atau string berkutip), dikembalikan apa adanya di `params`
-          examples:
-          - '{"nik": "3123456711950001", "refno": "PK19039Y8U"}'
         pipeline_name_sequence:
           anyOf:
           - items:
@@ -963,28 +964,20 @@ components:
           - type: string
           - type: 'null'
           title: Guardrails Confidence Threshold
-          description: 'Angka (0-1) untuk guardrail-identity, atau JSON per guardrail `{"identity": 0.8,
-            "blur": 0.7}` (`acc_rej` = `identity`). Tidak dikirim: ambang bawaan tiap service guardrail'
+          description: 'JSON object per guardrail, sisi accept, 0 < x < 1: `{"acc_rej": 0.8}` (= `identity`,
+            P(slip gaji)), `{"blur": 0.7}` (P(terbaca)). Tidak dikirim: ambang bawaan tiap service guardrail'
           examples:
-          - '0.8'
-        guardrails_tendency:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Guardrails Tendency
-          description: 'Berpasangan dengan ambang di atas. `accepted` (bawaan): lolos bila P(accept) >=
-            ambang. `rejected`: ditolak bila P(reject) >= ambang'
-          examples:
-          - accepted
+          - '{"acc_rej": 0.8}'
         column_confidence_threshold:
           anyOf:
           - type: string
           - type: 'null'
           title: Column Confidence Threshold
-          description: 'JSON per field, sisi accept, mis. `{"gaji_bersih": 0.9, "all_field": 0.6}`. Field
-            yang tidak disebut: `all_field`, lalu `FIELD_CONFIDENCE_THRESHOLD` (0,5)'
+          description: 'JSON per field, sisi accept: `{"all_field": 0.8}` untuk semua field, atau `{"gaji_bersih":
+            0.9}`; kunci field sendiri menang atas `all_field`. Field yang tidak disebut: `FIELD_CONFIDENCE_THRESHOLD`
+            (0,5)'
           examples:
-          - '{"all_field": 0.5}'
+          - '{"all_field": 0.8}'
       type: object
       required:
       - request_id
@@ -1128,20 +1121,13 @@ components:
             - scoring
           - type: 'null'
           title: Pipeline Last Stage
-          description: 'Service asal jawaban, dengan nama yang sama seperti di `pipeline_name_sequence`:
-            service yang menyelesaikan, menolak, gagal, atau sedang berjalan — atau `orchestrator` bila
-            permintaan ditolak pintu masuk sendiri sebelum satu pun service pipeline dipanggil (kunci
-            API, berkas, parameter, request_id tidak dikenal pada `GET`). Penolakan guardrail-blank /
-            -blur / -identity dilaporkan sebagai `guardrails`.'
+          description: 'Null pada jawaban sukses (200, 202). Pada galat: service asal galat, dengan nama
+            yang sama seperti di `pipeline_name_sequence` — yang menolak (`guardrails`: guardrail-blank
+            / -blur / -identity, atau `structuring`), yang gagal, atau yang tidak terjangkau — atau `orchestrator`
+            bila permintaan ditolak pintu masuk sendiri sebelum satu pun service pipeline dipanggil (kunci
+            API, berkas, urutan, ambang, `document_type`, request_id tidak dikenal pada `GET`)'
           examples:
-          - scoring
-        params:
-          title: Params
-          description: '`params` yang dikirim bersama `POST /v1/extract-ocr`, dikembalikan apa adanya;
-            null bila tidak dikirim. Tidak disimpan, jadi selalu null pada `GET /v1/extract-ocr/{request_id}`'
-          examples:
-          - nik: '3123456711950001'
-            refno: PK19039Y8U
+          - structuring
       type: object
       required:
       - status_code
@@ -1268,15 +1254,6 @@ components:
           description: Ambang yang dipakai pemeriksaan penentu
           examples:
           - 0.47
-        threshold_target:
-          anyOf:
-          - type: string
-            enum:
-            - accept
-            - reject
-          - type: 'null'
-          title: Threshold Target
-          description: Sisi ambang
       additionalProperties: true
       type: object
       title: GuardrailsDocument

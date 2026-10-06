@@ -4,9 +4,11 @@ Untuk tim Orkestrasi pusat. Mengikuti format API spec **[07] OCR NPWP**: envelop
 threshold 0–1, kode error, dan callback yang sama. Bedanya hanya di isi `data` (slip gaji, bisa beberapa
 slip per berkas) dan di tempat guardrail berjalan (setelah OCR).
 
-**Base URL** (GKE, dari namespace lain):
+**Base URL**. Dev: VM `gc-bribrain-dev-gce-facematch-01` dengan Docker (`deploy/vm/`):
 
-    http://ms-bribrain-nilam-ocr-slipgaji.nilam-ocr-slipgaji.svc.cluster.local:8034
+    http://<IP internal gc-bribrain-dev-gce-facematch-01>:8034
+
+Bila dipasang di GKE (`deploy/helm/`): `http://ms-bribrain-nilam-ocr-slipgaji.nilam-ocr-slipgaji.svc.cluster.local:8034`.
 
 Hanya orchestrator yang dipanggil. Semua endpoint kecuali `/health`, `/ready`, `/metrics` mewajibkan
 `X-API-Key`. Dokumen: JPEG/PNG/PDF, maks. **2,5 MB**, maks. **12 halaman** (`MAX_DOCUMENT_PAGES`; berkas tiga
@@ -24,18 +26,18 @@ atau 503 `unhealthy` dengan penyebab di `detail`.
 | `request_id` | Ya | Dari Orkestrasi pusat; request_id yang sama tidak menjalankan pipeline dua kali |
 | `document_type` | Tidak | Bawaan `slip_gaji`; selain itu 400 `UNSUPPORTED_DOCUMENT_TYPE` |
 | `file` / `file_url` | Salah satu | `file_url` harus berlaku > 5 menit (bisa diunduh ulang saat job diulang) |
-| `params` | Tidak | JSON object / string berkutip, dikembalikan apa adanya; tidak valid → 422 `INVALID_PARAMS` |
 | `pipeline_name_sequence` | Tidak | JSON array (atau field berulang). Tidak dikirim: keempatnya |
-| `guardrails_confidence_threshold` | Tidak | Angka 0–1 untuk guardrail-identity, atau JSON per guardrail `{"identity": 0.8, "blur": 0.7}` (`acc_rej` = `identity`) |
-| `guardrails_tendency` | Tidak | `accepted` (bawaan): lolos bila P(accept) ≥ threshold. `rejected`: ditolak bila P(reject) ≥ threshold |
-| `column_confidence_threshold` | Tidak | JSON per field, sisi accept, mis. `{"gaji_bersih": 0.9, "all_field": 0.6}`. Tidak disebut: `all_field`, lalu 0,5 |
+| `guardrails_confidence_threshold` | Tidak | JSON object per guardrail, sisi accept, 0 < x < 1: `{"acc_rej": 0.8}` (`acc_rej` = `identity`, kunci NPWP), `{"identity": 0.8, "blur": 0.7}`. Lolos bila P(accept) ≥ x (blur: 1 − P(rusak)). Angka polos, kunci lain, atau nilai di luar (0, 1) → 422 `INVALID_THRESHOLD`. Tidak dikirim: ambang tiap guardrail |
+| `column_confidence_threshold` | Tidak | JSON per field, sisi accept, mis. `{"gaji_bersih": 0.9, "all_field": 0.6}`. `all_field` diterapkan ke ke-20 field, kunci field sendiri didahulukan; tidak disebut: 0,5 |
+
+`params` dan `guardrails_tendency` (versi lama) diterima tetapi diabaikan, sama dengan NPWP.
 
 ```bash
 curl -X POST "$BASE/v1/extract-ocr" -H "X-API-Key: <API_KEY>" \
   -F request_id=OCR_9cb01af2-493d-446d-b191-af120333f6d0 \
   -F file=@slip.pdf;type=application/pdf \
   -F 'pipeline_name_sequence=["guardrails","extraction","structuring","scoring"]' \
-  -F guardrails_confidence_threshold=0.5 -F guardrails_tendency=accepted \
+  -F 'guardrails_confidence_threshold={"acc_rej":0.5}' \
   -F 'column_confidence_threshold={"all_field":0.5}'
 ```
 
@@ -57,8 +59,8 @@ curl -X POST "$BASE/v1/extract-ocr" -H "X-API-Key: <API_KEY>" \
       "missing_mandatory_fields": []
     }]
   },
-  "errors": null, "request_id": "OCR_9cb01af2-...", "guardrails": 0,
-  "pipeline_last_stage": "scoring", "params": null
+  "errors": null, "request_id": "OCR_9cb01af2-...",
+  "pipeline_last_stage": null, "guardrails": 0
 }
 ```
 
@@ -74,7 +76,7 @@ curl -X POST "$BASE/v1/extract-ocr" -H "X-API-Key: <API_KEY>" \
 | Field envelope | Keterangan |
 |---|---|
 | `guardrails` | 1 = ditolak (guardrail atau aturan structuring), 0 = tidak, null = masih diproses / error sebelum dinilai |
-| `pipeline_last_stage` | Service asal jawaban: `orchestrator`, `guardrails`, `extraction`, `structuring`, `scoring` |
+| `pipeline_last_stage` | null pada 200 dan 202. Pada error: service yang gagal / menolak (`guardrails`, `extraction`, `structuring`, `scoring`), atau `orchestrator` untuk penolakan di pintu masuk |
 
 ## 3. Pipeline Name Sequence
 
@@ -98,7 +100,7 @@ teks per halaman (`pages`), bukan `blocks` per baris.
 
 ```json
 {"passed": true, "reason": null,
- "document": {"verdict": "accepted", "confidence": 0.9934, "n_pages": 3, "threshold": 0.47, "threshold_target": "accept"},
+ "document": {"verdict": "accepted", "confidence": 0.9934, "n_pages": 3, "threshold": 0.47},
  "pages": [],
  "checks": {"blank": {...}, "blur": {"p_broken": 0.0153, ...}, "identity": {"proba_slip_gaji": 0.9934, ...}},
  "skipped": [], "unavailable": []}
@@ -111,22 +113,24 @@ dua yang lain tetap memutuskan). Urutan penolakan: kosong > buram > bukan slip g
 
 Kontrak sama dengan POST, tanpa menunggu: 200 selesai, 202 berjalan, 400 ditolak, 422 tahap gagal, 404
 `REQUEST_ID_NOT_FOUND`. Sequence dan `column_confidence_threshold` dibaca dari job, jadi jawabannya sama
-dengan POST. `params` selalu null.
+dengan POST.
 
 ## 5. Callback (jawaban 202)
 
-`ORCHESTRATION_CALLBACK_FORMAT=result`: satu POST per request ke `ORCHESTRATION_URL` +
-`ORCHESTRATION_CALLBACK_PATH`, header `X-Callback-Key`.
+`ORCHESTRATION_CALLBACK_FORMAT=result`: satu POST per request saat selesai ke `ORCHESTRATION_URL` +
+`ORCHESTRATION_CALLBACK_PATH`, header `X-Callback-Key`. Bentuknya sama dengan NPWP:
 
-```json
-{"request_id": "...", "status": "completed",
- "result": {"total_slip": 1, "slip": [{"page": 1, "gaji_pokok": {"value": 4500000, "confidence": 0.9361}, ...}]},
- "guardrails": {"passed": true, ...}}
-```
+| Keadaan | Body |
+|---|---|
+| Selesai | `{"request_id", "status": "completed", "result": <data jawaban 200>, "guardrails": 0}` |
+| Ditolak (guardrail / aturan structuring) | `{"request_id", "status": "completed", "result": null, "guardrails": 1, "message": "<alasan>", "error_code": "DOWNSTREAM_VALIDATION_ERROR"}` |
+| Gagal | `{"request_id", "status": "failed", "error_code": "<TAHAP>_FAILED", "message": "<alasan>"}` |
 
-`confidence` di callback adalah **probabilitas 0–1 mentah** (bukan 0/1). Sequence yang berhenti sebelum
-scoring: `result` = hasil service terakhir apa adanya, `guardrails` `{}`. Gagal/ditolak:
-`{"status": "failed", "result": null, "guardrails": {}, "error_code": "...", "error_message": "..."}`.
+`result` sama persis dengan `data` jawaban 200 untuk request itu: `{total_slip, slip[]}` dengan confidence
+**0/1** memakai `column_confidence_threshold` request; sequence yang berhenti lebih awal: hasil tahap
+terakhirnya apa adanya. Callback yang dijawab 5xx / tidak terjangkau dicoba ulang (outbox) sampai
+`ORCHESTRATION_CALLBACK_MAX_AGE_SECONDS` (600); 409 `RESULT_NOT_READY` dikirim ulang 5× tiap 1,5 detik.
+Mode poll: `ORCHESTRATION_CALLBACK_ENABLED=false`, tidak ada callback; baca `GET /v1/extract-ocr/{request_id}`.
 Pengiriman at-least-once, bisa tidak berurutan; perlakukan idempoten.
 
 ## 6. Error Codes
@@ -139,7 +143,7 @@ Pengiriman at-least-once, bisa tidak berurutan; perlakukan idempoten.
 | 401 | `UNAUTHORIZED` | `X-API-Key` salah / tidak ada |
 | 404 | `REQUEST_ID_NOT_FOUND` | GET request_id tidak dikenal |
 | 413 | `FILE_TOO_LARGE` | Lebih dari 2,5 MB |
-| 422 | `VALIDATION_ERROR` / `INVALID_PARAMS` / `INVALID_PIPELINE_SEQUENCE` / `INVALID_THRESHOLD` | Parameter tidak valid; tidak ada yang jalan |
+| 422 | `VALIDATION_ERROR` / `INVALID_PIPELINE_SEQUENCE` / `INVALID_THRESHOLD` | Parameter tidak valid; tidak ada yang jalan |
 | 422 | `OCR_FAILED` / `STRUCTURING_FAILED` / `SCORING_FAILED` | Tahap gagal; alasan di `message` |
 | 500 | `DOWNSTREAM_SERVER_ERROR` | Service internal menjawab di luar kontrak; aman dikirim ulang |
 | 500 | `INTERNAL_SERVER_ERROR` | Galat tak terduga di orchestrator; aman dikirim ulang |
@@ -147,3 +151,18 @@ Pengiriman at-least-once, bisa tidak berurutan; perlakukan idempoten.
 | 504 | `DOWNSTREAM_TIMEOUT` | Service internal tidak menjawab; aman dikirim ulang |
 
 Setiap error membawa `pipeline_last_stage`; penolakan di pintu masuk selalu `orchestrator`.
+
+## 7. Basis data
+
+Cloud SQL database **`nilam`** (`edm-bribrain-dev-01:asia-southeast2:gc-bribrain-dev-sql-psql-01`, dipakai bersama
+dokumen NILAM lain seperti SHM), skema **`nilam_ocr_slipgaji`**: tabel job/hasil per tahap
+`nilam_{ocr,structuring,scoring}_{jobs,results}`, `nilam_pipeline_outbox`, `nilam_guardrails_results`, kembaran
+`nilam_testing_*` untuk endpoint `-test`, versi migrasi `nilam_ocr_slipgaji_alembic_version`, dan
+**`system_prompt`** (DDL tim: `version`, `system_prompt`, `is_active`, `change_note`, `created_at`; paling banyak
+satu baris aktif) untuk prompt LLM bila `PROMPT_SOURCE=db`. Semua dibuat migrasi `db/` (0010 memindahkan tabel
+lama dari `public` beserta isinya).
+
+## 8. Endpoint internal tanpa pipeline
+
+Untuk pengujian tim ML, tidak dipanggil Orkestrasi: `POST /v1/structuring-direct` (structuring, body
+`{document_type, ocr}`) dan `POST /v1/scoring-direct` (scoring), sinkron, tanpa job dan tanpa basis data.

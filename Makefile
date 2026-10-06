@@ -24,12 +24,12 @@ lock: $(SERVICES:%=lock-%) lock-db
 lock-orchestrator:
 	$(LOCK) services/orchestrator/requirements.txt libs/ocr_common/pyproject.toml --extra db -o services/orchestrator/requirements.lock
 lock-extraction lock-structuring lock-scoring: lock-%:
-	$(LOCK) services/$*/requirements.txt libs/ocr_common/pyproject.toml --extra db -o services/$*/requirements.lock
+	$(LOCK) services/$*/requirements.txt libs/ocr_common/pyproject.toml --extra db --extra cloudsql --extra gcs -o services/$*/requirements.lock
 # Ketiga guardrail tidak punya basis data: mereka menjawab satu pertanyaan dan tidak menyimpan apa pun.
 lock-guardrail-blank lock-guardrail-blur lock-guardrail-identity: lock-%:
-	$(LOCK) services/$*/requirements.txt libs/ocr_common/pyproject.toml -o services/$*/requirements.lock
+	$(LOCK) services/$*/requirements.txt libs/ocr_common/pyproject.toml --extra gcs -o services/$*/requirements.lock
 lock-db:
-	$(LOCK) db/requirements.txt libs/ocr_common/pyproject.toml -o db/requirements.lock
+	$(LOCK) db/requirements.txt libs/ocr_common/pyproject.toml --extra cloudsql -o db/requirements.lock
 # Gagal kalau ada lock yang ketinggalan dari requirements.txt / pyproject ocr_common (lock-nya ikut diperbarui).
 lock-check: lock
 	@test -z "$$(git status --porcelain -- services/*/requirements.lock db/requirements.lock)" \
@@ -94,7 +94,7 @@ split:
 	$(PY) scripts/split_services.py
 
 helm-lint:
-	helm lint deploy/helm/nilam-ocr-slipgaji -f deploy/helm/nilam-ocr-slipgaji/values-dev.yaml
+	helm lint deploy/helm/nilam-ocr-slipgaji -f deploy/helm/nilam-ocr-slipgaji/values-ddb-dev.yaml
 
 # Menjalankan di laptop tidak lewat make: `make` tidak ada di Windows, dan .ps1 ditolak pada mesin
 # yang ExecutionPolicy-nya masih Restricted. Lihat local/README.md.

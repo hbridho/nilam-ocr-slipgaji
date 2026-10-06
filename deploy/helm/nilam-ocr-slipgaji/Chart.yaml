@@ -4,5 +4,5 @@ description: >-
   OCR Slip Gaji pipeline (NILAM), one Deployment per service: ms-bribrain-nilam-ocr-slipgaji-orchestrator,
   -extraction, -guardrail-blank, -guardrail-blur, -guardrail-identity, -structuring, -scoring
 type: application
-version: 0.5.0
-appVersion: "0.5.0"
+version: 0.6.0
+appVersion: "0.6.0"

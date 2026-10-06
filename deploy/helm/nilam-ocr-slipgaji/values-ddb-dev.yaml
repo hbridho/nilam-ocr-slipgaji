@@ -1,0 +1,89 @@
+# GKE dev (gc-ddb-dev-gke-cluster-01, namespace nilam-ocr-slipgaji), nama berkas sama dengan nilam-ocr-npwp.
+# Target dev slip gaji yang disepakati adalah VM gc-bribrain-dev-gce-facematch-01 dengan Docker (deploy/vm/);
+# chart ini dijaga setara untuk kalau slip gaji dipindah ke GKE. Placeholder di bawah dikonfirmasi tim deploy:
+# registry, alamat layanan OCR, endpoint callback Orkestrasi, namespace klien.
+environment: dev
+
+image:
+  # Diisi CI / tim deploy dengan SHA commit (--set image.tag=<sha>); kosong = Chart.appVersion.
+  tag: ""
+
+existingSecret: nilam-ocr-slipgaji-secrets
+
+orchestration:
+  # Callback hasil ke Orkestrasi (endpoint dari tim Orkestrasi, 24 Sep 2026): satu POST per request
+  # saat selesai, dengan X-Callback-Key = ORCHESTRATION_CALLBACK_KEY di Secret nilam-ocr-slipgaji-secrets.
+  # Key itu WAJIB ada di Secret sebelum deploy: tanpa key, extraction/structuring/scoring menolak start.
+  url: http://ocr-orchestration.ocr-dev.svc.cluster.local
+  callbackPath: /v1/ocr-callback
+  callbackFormat: result
+
+commonEnv:
+  # Cloud SQL `nilam`, skema nilam_ocr_slipgaji (sama dengan nilam-ocr-shm: satu database, satu skema per dokumen).
+  # Kredensial CLOUDSQL_* (user bribrain_user, aplikasi Entra untuk Cloud SQL) di Secret nilam-ocr-slipgaji-secrets;
+  # DATABASE_URL tidak diisi. Pod harus menjangkau 10.213.224.113:3307.
+  CLOUDSQL_INSTANCE: edm-bribrain-dev-01:asia-southeast2:gc-bribrain-dev-sql-psql-01
+  CLOUDSQL_DATABASE: nilam
+  CLOUDSQL_IP_TYPE: PRIVATE
+  # Double write ke log API Orkestrasi dimatikan (5 Okt 2026, sama dengan NPWP): di mode callback Orkestrasi
+  # membaca hasil dari tabel job-nya sendiri, dan tabel lama ocr.orchestration_api_events sudah dihapus oleh
+  # migrasi mereka. Tulisan itu ada di transaksi job kita, jadi tabel yang hilang menggagalkan setiap job.
+  # Kosong, bukan dihapus: deploy.sh memakai --reset-then-reuse-values, jadi key yang dihapus tetap
+  # terbawa dari release sebelumnya.
+  ORCHESTRATION_API_EVENTS_TABLE: ""
+  # Outbox transaksional: hand-off dan callback ditulis ke nilam_pipeline_outbox bersama hasil job, lalu dikirim
+  # relay dengan backoff (sampai 5 menit sekali, selama 24 jam), jadi tidak hilang saat pod restart atau
+  # penerima down.
+  PIPELINE_OUTBOX: "true"
+  # Load test tim ML lewat kubectl port-forward ke orchestrator, /v1/extract-ocr-test. Butuh tabel
+  # nilam_testing_* (migrasi 0006, dipindah 0010). Lihat README, "Endpoint testing".
+  TESTING_ENDPOINTS: "true"
+
+# Cloud SQL tidak butuh GKE Workload Identity: connector memakai aplikasi Entra CLOUDSQL_AZURE_* -> WIF ->
+# gc-bribrain-dev-sac-sql-01 (deploy/helm/README.md, "Cloud SQL").
+
+# Model guardrail dan scoring dari GCS (bucket gc-bribrain-dev-gcs-ocr-nilam-01, folder nilam-ocr-slipgaji, diunggah
+# dari dist/gcs/ hasil scripts/export_gcs_models.py). Buka komentar ini, juga *_MODEL_GCS_URI di services di
+# bawah, setelah: (1) Secret punya AZURE_CLIENT_SECRET dari wif.gcs.env; (2) pod terbukti bisa menjangkau
+# login.microsoftonline.com dan *.googleapis.com (deploy/helm/README.md, "Model dari GCS").
+# gcpWif:
+#   tenantId: <dari wif.gcs.env>
+#   clientId: <dari wif.gcs.env>
+#   projectNumber: "<dari wif.gcs.env>"
+#   poolId: <dari wif.gcs.env>
+#   providerId: <dari wif.gcs.env>
+#   serviceAccountEmail: <dari wif.gcs.env>
+
+networkPolicy:
+  # Namespace Orkestrasi di cluster dev. Cluster ini memakai LEGACY_DATAPATH tanpa
+  # network policy enforcement, jadi policy hanya terpasang, belum ditegakkan.
+  clientNamespaces: [ocr-dev]
+
+services:
+  extraction:
+    env:
+      EXTRACTION_OCR_URL: http://10.213.128.67:8070
+  # guardrail-blank:
+  #   env:
+  #     BLANK_MODEL_GCS_URI: gs://gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/guardrails/unreadable_doc_confidence/v1/unreadable_doc_confidence_v1.json
+  # guardrail-blur:
+  #   env:
+  #     BLUR_MODEL_GCS_URI: gs://gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/guardrails/unreadable_doc_confidence/v1/unreadable_doc_confidence_v1.json
+  # guardrail-identity:
+  #   env:
+  #     IDENTITY_MODEL_GCS_URI: gs://gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/guardrails/is_slip_gaji_doc_confidence/v1/is_slip_gaji_doc_confidence_v1.json
+  # scoring:
+  #   env:
+  #     SCORING_MODEL_GCS_URI: gs://gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/scoring/field_confidence/v1/field_confidence_v1.json
+
+# Node l5uf di cluster dev rusak tetapi tetap Ready dan menerima pod (29 Sep 2026): sandbox pod baru tidak
+# pernah dibuat (FailedCreatePodSandBox DeadlineExceeded) dan pod tim lain macet Terminating di sana. Node itu
+# milik cluster bersama, jadi pod kita saja yang menghindarinya. Hapus blok ini setelah node diganti.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: NotIn
+              values: [gke-gc-ddb-dev-gke-c-gc-dgv-dev-ndp-c-42b3b8a0-l5uf]

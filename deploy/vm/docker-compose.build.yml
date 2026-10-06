@@ -1,0 +1,25 @@
+# Build the images on the VM itself instead of pulling them from Artifact Registry (when the VM has no access to
+# the registry). From deploy/vm, with the repo checked out at the commit to deploy:
+#
+#   export REGISTRY=local TAG=$(git rev-parse --short HEAD)
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#   docker compose --profile migrate run --rm migrate && docker compose up -d
+#
+# The build context is the repo root: every Dockerfile copies libs/.
+services:
+  orchestrator:
+    build: {context: ../.., dockerfile: services/orchestrator/Dockerfile}
+  extraction:
+    build: {context: ../.., dockerfile: services/extraction/Dockerfile}
+  guardrail-blank:
+    build: {context: ../.., dockerfile: services/guardrail-blank/Dockerfile}
+  guardrail-blur:
+    build: {context: ../.., dockerfile: services/guardrail-blur/Dockerfile}
+  guardrail-identity:
+    build: {context: ../.., dockerfile: services/guardrail-identity/Dockerfile}
+  structuring:
+    build: {context: ../.., dockerfile: services/structuring/Dockerfile}
+  scoring:
+    build: {context: ../.., dockerfile: services/scoring/Dockerfile}
+  migrate:
+    build: {context: ../.., dockerfile: db/Dockerfile}

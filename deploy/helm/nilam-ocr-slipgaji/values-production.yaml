@@ -24,7 +24,8 @@ networkPolicy:
 services:
   extraction:
     env:
-      EXTRACTION_OCR_URL: <http://paddle-ocr-service:port>  orchestrator:
+      EXTRACTION_OCR_URL: <http://paddle-ocr-service:port>
+  orchestrator:
     replicaCount: 2
   guardrail-blank:
     replicaCount: 2

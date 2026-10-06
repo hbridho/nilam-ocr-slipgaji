@@ -26,6 +26,28 @@ secretKeys:
   orchestrationApiKey: ORCHESTRATION_API_KEY
   # Nilai X-Callback-Key untuk callback hasil Orkestrasi (orchestration.callbackFormat: result).
   callbackKey: ORCHESTRATION_CALLBACK_KEY
+  # Opsional: kredensial server Elastic APM, salah satu sesuai server APM-nya (lihat apm di bawah).
+  apmSecretToken: ELASTIC_APM_SECRET_TOKEN
+  apmApiKey: ELASTIC_APM_API_KEY
+  # Client secret app Entra ID untuk identitas GCS (gcpWif di bawah); wajib di Secret begitu gcpWif.clientId diisi.
+  # Masuk ke container sebagai AZURE_CLIENT_SECRET. Key-nya sengaja bukan AZURE_CLIENT_SECRET (nama di NPWP):
+  # key itu dipakai app Entra untuk Bedrock (LLM structuring), app yang berbeda.
+  gcpWifClientSecret: GCS_AZURE_CLIENT_SECRET
+
+# Database lewat Cloud SQL (ocr_common.pipeline.cloudsql), seperti nilam-ocr-shm: CLOUDSQL_INSTANCE, CLOUDSQL_DATABASE,
+# CLOUDSQL_IP_TYPE di commonEnv; kredensial di bawah dari Secret, ke service yang memakai database. Opsional: yang tidak
+# ada di Secret dilewati. CLOUDSQL_PASSWORD kosong = login IAM (service account). Tanpa CLOUDSQL_INSTANCE, service
+# memakai DATABASE_URL dari Secret. Jangan isi keduanya: service menolak start.
+cloudsqlSecretKeys:
+  CLOUDSQL_USER: CLOUDSQL_USER
+  CLOUDSQL_PASSWORD: CLOUDSQL_PASSWORD
+  CLOUDSQL_AZURE_TENANT_ID: CLOUDSQL_AZURE_TENANT_ID
+  CLOUDSQL_AZURE_CLIENT_ID: CLOUDSQL_AZURE_CLIENT_ID
+  CLOUDSQL_AZURE_CLIENT_SECRET: CLOUDSQL_AZURE_CLIENT_SECRET
+  CLOUDSQL_GCP_PROJECT_NUMBER: CLOUDSQL_GCP_PROJECT_NUMBER
+  CLOUDSQL_GCP_POOL_ID: CLOUDSQL_GCP_POOL_ID
+  CLOUDSQL_GCP_PROVIDER_ID: CLOUDSQL_GCP_PROVIDER_ID
+  CLOUDSQL_GCP_SERVICE_ACCOUNT_EMAIL: CLOUDSQL_GCP_SERVICE_ACCOUNT_EMAIL
 
 # Buat Secret di atas dari GCP Secret Manager lewat External Secrets Operator.
 # Mati = Secret dibuat manual (lihat README). Butuh CRD ESO dan ClusterSecretStore di cluster.
@@ -55,6 +77,38 @@ orchestration:
   # result = satu callback hasil per request saat selesai (completed dari scoring, failed dari tahap
   #          mana pun) dengan X-Callback-Key dari secretKeys.callbackKey; tanpa key, service menolak start.
   callbackFormat: stage
+  # Saklar callback: false = tidak ada callback yang dikirim maupun diantrekan walau url terisi, mis. selama
+  # Orkestrasi pusat memasang slip gaji di mode poll (setiap callback dijawab 409 CALLBACK_NOT_EXPECTED; mereka
+  # membaca GET /v1/extract-ocr/{request_id}). Harus mengikuti mode di sisi mereka.
+  callbackEnabled: true
+  # Berapa lama outbox mencoba ulang callback yang gagal (5xx / tidak terjangkau). Orkestrasi pusat berhenti
+  # menunggu sejumlah detik setelah menjawab 202 (OCR_CALLBACK_DEADLINE_SECONDS di sisi mereka) dan menolak
+  # callback sesudahnya dengan 409 RESULT_CONFLICT; samakan dengan nilai itu.
+  callbackMaxAgeSeconds: "600"
+
+# Elastic APM di ketujuh service (libs/ocr_common/ocr_common/web/apm.py), nama service APM
+# ms-bribrain-nilam-ocr-slipgaji-<nama>. serverUrl kosong = mati: agen tidak dimuat dan tidak ada yang dikirim.
+# Token/API key dibaca dari Secret (secretKeys.apmSecretToken / apmApiKey), opsional. Isi body dan header request
+# tidak pernah dikirim (dokumen, nama, gaji, API key).
+apm:
+  serverUrl: ""
+  # Kosong = nilai `environment` di atas.
+  environment: ""
+  # 1.0 = setiap request dan job dilacak; turunkan kalau volumenya besar.
+  transactionSampleRate: "1.0"
+  verifyServerCert: true
+
+# Identitas GCP lewat Workload Identity Federation dengan Entra ID (panduan Tim SEA, wif.gcs.env), dipakai service
+# dengan `gcsModels: true` untuk mengunduh modelnya dari GCS saat start (<SERVICE>_MODEL_GCS_URI + _SHA256 di
+# services.<nama>.env). clientId kosong = tidak dirender; client secret dari Secret (secretKeys.gcpWifClientSecret).
+# Tanpa URI, service memakai model yang ikut di image.
+gcpWif:
+  tenantId: ""
+  clientId: ""
+  projectNumber: ""
+  poolId: ""
+  providerId: ""
+  serviceAccountEmail: ""
 
 commonEnv:
   # Host yang boleh dipakai file_url (presigned MinIO), dipisah koma; ".example.internal" = semua subdomain.
@@ -69,7 +123,9 @@ commonEnv:
 #                dan NetworkPolicy-nya menerima namespace di networkPolicy.clientNamespaces. Hanya
 #                orchestrator; yang lain internal.
 #   pipeline   : tahap async yang butuh DATABASE_URL dan konfigurasi Orkestrasi.
-#   database   : butuh DATABASE_URL tanpa konfigurasi Orkestrasi (orchestrator: tabel guardrails_results).
+#   database   : butuh DATABASE_URL tanpa konfigurasi Orkestrasi. Semua tabel ada di skema nilam_ocr_slipgaji
+#                (nilam_*, system_prompt; migrasi 0010).
+#   gcsModels  : mengunduh modelnya dari GCS saat start kalau <SERVICE>_MODEL_GCS_URI diisi (lihat gcpWif).
 #   rollingUpdate: {maxSurge, maxUnavailable} saat rollout; default 1 / 0 (pod baru siap dulu, tanpa jeda).
 #                Cluster yang tidak punya ruang untuk pod tambahan: 0 / 1 (pod lama dimatikan dulu).
 #   upstreams  : service lain yang dipanggil; chart mengisi <NAMA>_SERVICE_URL dan NetworkPolicy dari sini.
@@ -130,6 +186,8 @@ services:
     port: 8035
     entrypoint: false
     pipeline: false
+    # Batas teks kosong (blank_max_chars) dibaca dari model mutu: unreadable_doc_confidence di GCS.
+    gcsModels: true
     upstreams: []
     replicaCount: 2
     startupFailureThreshold: 15
@@ -138,6 +196,7 @@ services:
       BLANK_BACKEND: slip_blank
       # Teks <= 20 karakter dianggap halaman kosong. Kosong = ambang bawaan model.
       # BLANK_MAX_CHARS: "20"
+      # BLANK_MODEL_GCS_URI: gs://gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/guardrails/unreadable_doc_confidence/v1/unreadable_doc_confidence_v1.json
     resources:
       requests:
         cpu: 50m
@@ -157,6 +216,7 @@ services:
     port: 8036
     entrypoint: false
     pipeline: false
+    gcsModels: true
     upstreams: []
     replicaCount: 2
     startupFailureThreshold: 15
@@ -165,6 +225,7 @@ services:
       BLUR_BACKEND: slip_blur
       # Kosong = ambang model (0,9584).
       # BLUR_THRESHOLD: "0.9584"
+      # BLUR_MODEL_GCS_URI: gs://gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/guardrails/unreadable_doc_confidence/v1/unreadable_doc_confidence_v1.json
     resources:
       requests:
         cpu: 100m
@@ -186,16 +247,18 @@ services:
     port: 8037
     entrypoint: false
     pipeline: false
+    gcsModels: true
     upstreams: []
     replicaCount: 2
     startupFailureThreshold: 15
     terminationGracePeriodSeconds: 30
     env:
       IDENTITY_BACKEND: slip_identity
-      # Kosong = ambang model (0,47).
-      # IDENTITY_REJECT_THRESHOLD: "0.47"
+      # Lolos kalau P(slip gaji) >= ambang. Kosong = ambang model (0,47). Orkestrasi pusat menjawab {"threshold": x}.
+      # IDENTITY_THRESHOLD: "0.47"
       # IDENTITY_THRESHOLD_URL: http://<orkestrasi-pusat>
       # IDENTITY_THRESHOLD_PATH: /v1/thresholds/guardrails
+      # IDENTITY_MODEL_GCS_URI: gs://gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/guardrails/is_slip_gaji_doc_confidence/v1/is_slip_gaji_doc_confidence_v1.json
     resources:
       requests:
         cpu: 100m
@@ -266,9 +329,9 @@ services:
       #
       # DARI MANA prompt dibaca. Teksnya tidak pernah ada di kode atau setelan; ini penunjuknya.
       #   file (bawaan): /app/prompts/slip_gaji.v1.md di dalam image, atau PROMPT_PATH (ConfigMap/volume).
-      #   db: baris tabel `prompts` (migrasi 0010); PROMPT_VERSION kosong = baris active terbaru.
+      #   db: tabel nilam_ocr_slipgaji.system_prompt (migrasi 0010, DDL tim); PROMPT_VERSION kosong = baris
+      #       is_active = TRUE (paling banyak satu), angka = kolom `version`.
       PROMPT_SOURCE: file
-      # PROMPT_NAME: slip_gaji
       # PROMPT_VERSION: "1"
       # PROMPT_PATH: /etc/prompts/slip_gaji.v2.md
       # PROMPT_DB_FALLBACK_TO_FILE: "true"
@@ -288,6 +351,7 @@ services:
     port: 8033
     entrypoint: false
     pipeline: true
+    gcsModels: true
     upstreams: []
     replicaCount: 1
     startupFailureThreshold: 15
@@ -295,6 +359,7 @@ services:
       PIPELINE_DRAIN_TIMEOUT_SECONDS: "30"
       SCORING_BACKEND: conf_v2
       FIELD_CONFIDENCE_THRESHOLD: "0.5"
+      # SCORING_MODEL_GCS_URI: gs://gc-bribrain-dev-gcs-ocr-nilam-01/nilam-ocr-slipgaji/scoring/field_confidence/v1/field_confidence_v1.json
     resources:
       requests:
         cpu: 250m

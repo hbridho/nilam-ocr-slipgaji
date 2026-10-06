@@ -68,11 +68,21 @@ spec:
                   key: {{ $.Values.secretKeys.apiKeys }}
                   optional: true
             {{- if or $svc.pipeline $svc.database }}
+            {{- /* DATABASE_URL (Postgres biasa) atau kredensial Cloud SQL (CLOUDSQL_*); yang tidak ada di Secret dilewati. */}}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ $.Values.existingSecret }}
                   key: {{ $.Values.secretKeys.databaseUrl }}
+                  optional: true
+            {{- range $envName, $secretKey := $.Values.cloudsqlSecretKeys }}
+            - name: {{ $envName }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.existingSecret }}
+                  key: {{ $secretKey }}
+                  optional: true
+            {{- end }}
             {{- end }}
             {{- if $svc.pipeline }}
             - name: ORCHESTRATION_API_KEY
@@ -86,6 +96,27 @@ spec:
                 secretKeyRef:
                   name: {{ $.Values.existingSecret }}
                   key: {{ $.Values.secretKeys.callbackKey }}
+                  optional: true
+            {{- end }}
+            {{- if and $svc.gcsModels $.Values.gcpWif.clientId }}
+            - name: AZURE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.existingSecret }}
+                  key: {{ $.Values.secretKeys.gcpWifClientSecret }}
+            {{- end }}
+            {{- if $.Values.apm.serverUrl }}
+            - name: ELASTIC_APM_SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.existingSecret }}
+                  key: {{ $.Values.secretKeys.apmSecretToken }}
+                  optional: true
+            - name: ELASTIC_APM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.existingSecret }}
+                  key: {{ $.Values.secretKeys.apmApiKey }}
                   optional: true
             {{- end }}
             - name: HOME

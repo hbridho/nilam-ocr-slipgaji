@@ -1,0 +1,254 @@
+# Slip gaji di VM dev gc-bribrain-dev-gce-facematch-01 dengan Docker (target per dokumen dari tim, 6 Okt 2026).
+# Tujuh container dari image yang sama dengan GKE (Artifact Registry, tag = SHA commit); runbook: README.md di sini.
+#
+#   cp vm.env.example .env          # isi; JANGAN commit (berisi API key, kredensial Cloud SQL, callback key)
+#   docker compose pull
+#   docker compose --profile migrate run --rm migrate
+#   docker compose up -d
+#
+# Hanya orchestrator yang membuka port di VM (ORCHESTRATOR_BIND:8034); enam lainnya hanya di jaringan
+# `slipgaji` milik compose ini, saling memanggil dengan nama service. Setiap nilai berasal dari .env (interpolasi,
+# urutannya sama dengan vm.env.example); .env tidak pernah masuk utuh ke container, jadi setiap service hanya
+# menerima variabel yang memang miliknya (CLOUDSQL_* hanya ke ketiga tahap pipeline dan migrate, identitas GCS hanya
+# ke yang mengunduh model, Bedrock hanya ke structuring). Variabel kosong = bawaan service.
+# Setelan lain per service yang tidak ada di vm.env.example: env/<service>.env, opsional.
+name: nilam-ocr-slipgaji
+
+x-service: &service
+  restart: unless-stopped
+  # Sama dengan pod GKE: root filesystem read-only, /tmp tulis (model dari GCS diunduh ke /tmp/models).
+  read_only: true
+  tmpfs:
+    - /tmp
+  # Drain job 30 dtk (PIPELINE_DRAIN_TIMEOUT_SECONDS) + cadangan, seperti terminationGracePeriodSeconds.
+  stop_grace_period: 45s
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+  networks: [slipgaji]
+
+# 2 + 11. Diterima semua service.
+x-common-env: &common-env
+  ENVIRONMENT: ${ENVIRONMENT:-dev}
+  API_KEY: ${API_KEY:?isi API_KEY di .env}
+  API_KEYS: ${API_KEYS:-}
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-}
+  FILE_URL_ALLOWED_HOSTS: ${FILE_URL_ALLOWED_HOSTS:-}
+  TESTING_ENDPOINTS: ${TESTING_ENDPOINTS:-false}
+  FIELD_CONFIDENCE_THRESHOLD: ${FIELD_CONFIDENCE_THRESHOLD:-}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_FORMAT: ${LOG_FORMAT:-}
+  ELASTIC_APM_SERVER_URL: ${ELASTIC_APM_SERVER_URL:-}
+  ELASTIC_APM_SECRET_TOKEN: ${ELASTIC_APM_SECRET_TOKEN:-}
+  ELASTIC_APM_API_KEY: ${ELASTIC_APM_API_KEY:-}
+  # Agen APM membaca ELASTIC_APM_* langsung dari environment dan mendahulukannya: jangan biarkan kosong.
+  ELASTIC_APM_ENVIRONMENT: ${ELASTIC_APM_ENVIRONMENT:-dev}
+  ELASTIC_APM_TRANSACTION_SAMPLE_RATE: ${ELASTIC_APM_TRANSACTION_SAMPLE_RATE:-1.0}
+  ELASTIC_APM_VERIFY_SERVER_CERT: ${ELASTIC_APM_VERIFY_SERVER_CERT:-true}
+  HOME: /tmp
+
+# 9. Cloud SQL `nilam` lewat connector, seperti nilam-ocr-shm (ocr_common.pipeline.cloudsql). VM harus menjangkau IP
+# private instance di port 3307. Aplikasi Entra-nya sendiri (CLOUDSQL_AZURE_*), terpisah dari GCS dan Bedrock.
+x-cloudsql-env: &cloudsql-env
+  CLOUDSQL_INSTANCE: ${CLOUDSQL_INSTANCE:-edm-bribrain-dev-01:asia-southeast2:gc-bribrain-dev-sql-psql-01}
+  CLOUDSQL_DATABASE: ${CLOUDSQL_DATABASE:-nilam}
+  CLOUDSQL_IP_TYPE: ${CLOUDSQL_IP_TYPE:-PRIVATE}
+  CLOUDSQL_USER: ${CLOUDSQL_USER:-}
+  CLOUDSQL_PASSWORD: ${CLOUDSQL_PASSWORD:-}
+  CLOUDSQL_AZURE_TENANT_ID: ${CLOUDSQL_AZURE_TENANT_ID:?isi CLOUDSQL_AZURE_TENANT_ID di .env}
+  CLOUDSQL_AZURE_CLIENT_ID: ${CLOUDSQL_AZURE_CLIENT_ID:?isi CLOUDSQL_AZURE_CLIENT_ID di .env}
+  CLOUDSQL_AZURE_CLIENT_SECRET: ${CLOUDSQL_AZURE_CLIENT_SECRET:?isi CLOUDSQL_AZURE_CLIENT_SECRET di .env}
+  CLOUDSQL_GCP_PROJECT_NUMBER: ${CLOUDSQL_GCP_PROJECT_NUMBER:?isi CLOUDSQL_GCP_PROJECT_NUMBER di .env}
+  CLOUDSQL_GCP_POOL_ID: ${CLOUDSQL_GCP_POOL_ID:?isi CLOUDSQL_GCP_POOL_ID di .env}
+  CLOUDSQL_GCP_PROVIDER_ID: ${CLOUDSQL_GCP_PROVIDER_ID:?isi CLOUDSQL_GCP_PROVIDER_ID di .env}
+  CLOUDSQL_GCP_SERVICE_ACCOUNT_EMAIL: ${CLOUDSQL_GCP_SERVICE_ACCOUNT_EMAIL:?isi CLOUDSQL_GCP_SERVICE_ACCOUNT_EMAIL di .env}
+
+# 9 + 10. Ketiga tahap pipeline: basis data + laporan ke Orkestrasi pusat.
+x-pipeline-env: &pipeline-env
+  <<: [*common-env, *cloudsql-env]
+  ORCHESTRATION_URL: ${ORCHESTRATION_URL:-}
+  ORCHESTRATION_CALLBACK_PATH: ${ORCHESTRATION_CALLBACK_PATH:-/v1/ocr-callback}
+  ORCHESTRATION_CALLBACK_FORMAT: ${ORCHESTRATION_CALLBACK_FORMAT:-result}
+  ORCHESTRATION_CALLBACK_KEY: ${ORCHESTRATION_CALLBACK_KEY:-}
+  ORCHESTRATION_API_KEY: ${ORCHESTRATION_API_KEY:-}
+  ORCHESTRATION_CALLBACK_ENABLED: ${ORCHESTRATION_CALLBACK_ENABLED:-true}
+  ORCHESTRATION_CALLBACK_MAX_AGE_SECONDS: ${ORCHESTRATION_CALLBACK_MAX_AGE_SECONDS:-600}
+  ORCHESTRATION_TIMEOUT_SECONDS: ${ORCHESTRATION_TIMEOUT_SECONDS:-10}
+  ORCHESTRATION_OUTCOME_TABLE: ${ORCHESTRATION_OUTCOME_TABLE:-}
+  ORCHESTRATION_API_EVENTS_TABLE: ""
+  PIPELINE_OUTBOX: ${PIPELINE_OUTBOX:-true}
+  PIPELINE_DRAIN_TIMEOUT_SECONDS: "30"
+
+# 6. Service yang mengunduh modelnya dari GCS. Kosong semua = Application Default Credentials (service account VM).
+x-gcs-env: &gcs-env
+  AZURE_TENANT_ID: ${GCS_AZURE_TENANT_ID:-}
+  AZURE_CLIENT_ID: ${GCS_AZURE_CLIENT_ID:-}
+  AZURE_CLIENT_SECRET: ${GCS_AZURE_CLIENT_SECRET:-}
+  GCP_PROJECT_NUMBER: ${GCS_GCP_PROJECT_NUMBER:-}
+  GCP_POOL_ID: ${GCS_GCP_POOL_ID:-}
+  GCP_PROVIDER_ID: ${GCS_GCP_PROVIDER_ID:-}
+  GCP_SERVICE_ACCOUNT_EMAIL: ${GCS_GCP_SERVICE_ACCOUNT_EMAIL:-}
+
+services:
+  # 3. Pintu masuk tunggal: POST /v1/extract-ocr dan GET /v1/extract-ocr/{request_id}. Tanpa DB.
+  orchestrator:
+    <<: *service
+    image: ${REGISTRY:?isi REGISTRY di .env}/ms-bribrain-nilam-ocr-slipgaji-orchestrator:${TAG:?isi TAG di .env}
+    container_name: ms-bribrain-nilam-ocr-slipgaji-orchestrator
+    env_file:
+      - path: env/orchestrator.env
+        required: false
+    environment:
+      <<: *common-env
+      PORT: "8034"
+      EXTRACTION_SERVICE_URL: http://extraction:8030
+      STRUCTURING_SERVICE_URL: http://structuring:8032
+      SCORING_SERVICE_URL: http://scoring:8033
+      PIPELINE_WAIT_SECONDS: ${PIPELINE_WAIT_SECONDS:-15}
+      MAX_DOCUMENT_PAGES: ${MAX_DOCUMENT_PAGES:-}
+    ports:
+      - "${ORCHESTRATOR_BIND:-0.0.0.0}:8034:8034"
+    depends_on: [extraction, structuring, scoring]
+
+  # 4 + 5. OCR (layanan PaddleOCR di EXTRACTION_OCR_URL), lalu ketiga guardrail bersamaan, lalu serah ke structuring.
+  extraction:
+    <<: *service
+    image: ${REGISTRY}/ms-bribrain-nilam-ocr-slipgaji-extraction:${TAG}
+    container_name: ms-bribrain-nilam-ocr-slipgaji-extraction
+    env_file:
+      - path: env/extraction.env
+        required: false
+    environment:
+      <<: *pipeline-env
+      PORT: "8030"
+      EXTRACTION_BACKEND: api
+      EXTRACTION_OCR_URL: ${EXTRACTION_OCR_URL:?isi EXTRACTION_OCR_URL di .env}
+      EXTRACTION_OCR_ENDPOINT: ${EXTRACTION_OCR_ENDPOINT:-}
+      EXTRACTION_OCR_TIMEOUT_SECONDS: ${EXTRACTION_OCR_TIMEOUT_SECONDS:-60}
+      EXTRACTION_MAX_PAGES: ${EXTRACTION_MAX_PAGES:-}
+      EXTRACTION_RENDER_DPI: ${EXTRACTION_RENDER_DPI:-}
+      STRUCTURING_SERVICE_URL: http://structuring:8032
+      GUARDRAIL_BLANK_ENABLED: ${GUARDRAIL_BLANK_ENABLED:-true}
+      GUARDRAIL_BLANK_URL: http://guardrail-blank:8035
+      GUARDRAIL_BLUR_ENABLED: ${GUARDRAIL_BLUR_ENABLED:-true}
+      GUARDRAIL_BLUR_URL: http://guardrail-blur:8036
+      GUARDRAIL_IDENTITY_ENABLED: ${GUARDRAIL_IDENTITY_ENABLED:-true}
+      GUARDRAIL_IDENTITY_URL: http://guardrail-identity:8037
+      GUARDRAILS_FAIL_OPEN: ${GUARDRAILS_FAIL_OPEN:-true}
+      GUARDRAILS_TIMEOUT_SECONDS: ${GUARDRAILS_TIMEOUT_SECONDS:-10}
+    depends_on: [structuring, guardrail-blank, guardrail-blur, guardrail-identity]
+
+  # ── 5 + 6. Ketiga guardrail, tiga container, tanpa basis data ───────────────────────────────────────
+  guardrail-blank:
+    <<: *service
+    image: ${REGISTRY}/ms-bribrain-nilam-ocr-slipgaji-guardrail-blank:${TAG}
+    container_name: ms-bribrain-nilam-ocr-slipgaji-guardrail-blank
+    env_file:
+      - path: env/guardrail-blank.env
+        required: false
+    environment:
+      <<: [*common-env, *gcs-env]
+      PORT: "8035"
+      BLANK_BACKEND: slip_blank
+      BLANK_MAX_CHARS: ${BLANK_MAX_CHARS:-}
+      BLANK_MODEL_GCS_URI: ${QUALITY_MODEL_GCS_URI:-}
+      BLANK_MODEL_SHA256: ${QUALITY_MODEL_SHA256:-}
+
+  guardrail-blur:
+    <<: *service
+    image: ${REGISTRY}/ms-bribrain-nilam-ocr-slipgaji-guardrail-blur:${TAG}
+    container_name: ms-bribrain-nilam-ocr-slipgaji-guardrail-blur
+    env_file:
+      - path: env/guardrail-blur.env
+        required: false
+    environment:
+      <<: [*common-env, *gcs-env]
+      PORT: "8036"
+      BLUR_BACKEND: slip_blur
+      BLUR_THRESHOLD: ${BLUR_THRESHOLD:-}
+      BLUR_MODEL_GCS_URI: ${QUALITY_MODEL_GCS_URI:-}
+      BLUR_MODEL_SHA256: ${QUALITY_MODEL_SHA256:-}
+
+  guardrail-identity:
+    <<: *service
+    image: ${REGISTRY}/ms-bribrain-nilam-ocr-slipgaji-guardrail-identity:${TAG}
+    container_name: ms-bribrain-nilam-ocr-slipgaji-guardrail-identity
+    env_file:
+      - path: env/guardrail-identity.env
+        required: false
+    environment:
+      <<: [*common-env, *gcs-env]
+      PORT: "8037"
+      IDENTITY_BACKEND: slip_identity
+      IDENTITY_THRESHOLD: ${IDENTITY_THRESHOLD:-}
+      IDENTITY_THRESHOLD_URL: ${IDENTITY_THRESHOLD_URL:-}
+      IDENTITY_THRESHOLD_PATH: ${IDENTITY_THRESHOLD_PATH:-/v1/thresholds/guardrails}
+      IDENTITY_THRESHOLD_API_KEY: ${IDENTITY_THRESHOLD_API_KEY:-}
+      IDENTITY_MODEL_GCS_URI: ${IDENTITY_MODEL_GCS_URI:-}
+      IDENTITY_MODEL_SHA256: ${IDENTITY_MODEL_SHA256:-}
+
+  # 7. Teks -> 20 field per slip: aturan + arbitrase LLM (opsional), prompt dari file atau tabel system_prompt.
+  structuring:
+    <<: *service
+    image: ${REGISTRY}/ms-bribrain-nilam-ocr-slipgaji-structuring:${TAG}
+    container_name: ms-bribrain-nilam-ocr-slipgaji-structuring
+    env_file:
+      - path: env/structuring.env
+        required: false
+    environment:
+      <<: *pipeline-env
+      PORT: "8032"
+      STRUCTURING_BACKEND: slip_rules
+      SCORING_SERVICE_URL: http://scoring:8033
+      ENABLE_LLM: ${ENABLE_LLM:-false}
+      LLM_BACKEND: ${LLM_BACKEND:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_ENDPOINT: ${LLM_ENDPOINT:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-}
+      LLM_ALL_FIELDS: ${LLM_ALL_FIELDS:-}
+      LLM_REGION: ${LLM_REGION:-}
+      LLM_API_KEY_ENV: ${LLM_API_KEY_ENV:-}
+      LLM_GATEWAY_KEY: ${LLM_GATEWAY_KEY:-}
+      # Bedrock (core/bedrock.py membaca nama tanpa awalan): aplikasi Entra + role AWS khusus LLM.
+      AZURE_TENANT_ID: ${BEDROCK_AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${BEDROCK_AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${BEDROCK_AZURE_CLIENT_SECRET:-}
+      AWS_ROLE_ARN_BRIDGE: ${BEDROCK_AWS_ROLE_ARN_BRIDGE:-}
+      AWS_ROLE_ARN_TARGET: ${BEDROCK_AWS_ROLE_ARN_TARGET:-}
+      PROMPT_SOURCE: ${PROMPT_SOURCE:-file}
+      PROMPT_VERSION: ${PROMPT_VERSION:-}
+      PROMPT_DB_FALLBACK_TO_FILE: ${PROMPT_DB_FALLBACK_TO_FILE:-true}
+    depends_on: [scoring]
+
+  # 6 + 8. P(nilai benar) per field, skala 0-1; confidence 0/1 per ambang.
+  scoring:
+    <<: *service
+    image: ${REGISTRY}/ms-bribrain-nilam-ocr-slipgaji-scoring:${TAG}
+    container_name: ms-bribrain-nilam-ocr-slipgaji-scoring
+    env_file:
+      - path: env/scoring.env
+        required: false
+    environment:
+      <<: [*pipeline-env, *gcs-env]
+      PORT: "8033"
+      SCORING_BACKEND: conf_v2
+      SCORING_MODEL_GCS_URI: ${SCORING_MODEL_GCS_URI:-}
+      SCORING_MODEL_SHA256: ${SCORING_MODEL_SHA256:-}
+
+  # 9. Migrasi basis data (db/), dijalankan sebelum setiap rilis: docker compose --profile migrate run --rm migrate.
+  # Idempoten; membuat skema nilam_ocr_slipgaji di Cloud SQL `nilam` (migrasi 0010 memindahkan tabel lama ke sana).
+  migrate:
+    image: ${REGISTRY}/ms-bribrain-nilam-ocr-slipgaji-migrate:${TAG}
+    profiles: [migrate]
+    restart: "no"
+    environment:
+      <<: *cloudsql-env
+      HOME: /tmp
+    networks: [slipgaji]
+
+networks:
+  slipgaji:
+    name: nilam-ocr-slipgaji

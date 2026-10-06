@@ -1,4 +1,4 @@
--e libs/ocr_common[db]
+-e libs/ocr_common[db,cloudsql,gcs]
 # Model slip gaji dan pembungkusnya. Dulu dipasang dengan tangan dan tidak tercatat di sini, jadi
 # lingkungan baru selalu kurang satu paket tanpa pesan yang jelas.
 -e libs/slip_ml

@@ -1,7 +1,12 @@
 # Database
 
-Satu database PostgreSQL dipakai bersama oleh repo ini **dan** oleh service orkestrasi
-(`bribrain_ocr_nilam` di Cloud SQL). Karena itu penting jelas: tabel mana milik siapa.
+Satu database PostgreSQL dipakai bersama oleh repo ini, dokumen NILAM lain, **dan** service orkestrasi: Cloud SQL
+`nilam` (`edm-bribrain-dev-01:asia-southeast2:gc-bribrain-dev-sql-psql-01`). Tiap dokumen punya skemanya sendiri;
+semua tabel repo ini ada di skema **`nilam_ocr_slipgaji`** dengan awalan `nilam_` (migrasi `0010`), seperti
+`nilam_ocr_shm` milik SHM. Nama di tabel di bawah tanpa awalan itu. Karena itu penting jelas: tabel mana milik siapa.
+
+Koneksi: `CLOUDSQL_*` (Cloud SQL Python Connector, aplikasi Entra → WIF → service account; port 3307, lihat
+`libs/ocr_common/ocr_common/pipeline/cloudsql.py`), atau `DATABASE_URL` untuk Postgres lokal dan tes. Bukan keduanya.
 
 ## Peta tabel
 
@@ -60,7 +65,8 @@ gagal kalau keduanya menyimpang.
 ## Perintah
 
 ```bash
-export DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/bribrain_ocr_nilam
+export DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/nilam   # Postgres lokal
+# atau Cloud SQL: export CLOUDSQL_INSTANCE=... CLOUDSQL_DATABASE=nilam dan CLOUDSQL_* lainnya (deploy/vm/vm.env.example)
 
 make db-upgrade                  # jalankan migrasi sampai revisi terakhir
 make db-check                    # gagal kalau definisi tabel di kode beda dengan database
@@ -73,14 +79,15 @@ datanya dibiarkan, dan database itu tercatat berada di revisi baseline.
 
 ## Deploy
 
+Cloud SQL `nilam` hanya punya IP private (laptop tidak menjangkaunya), jadi migrasi jalan dari mesin di VPC:
+
 ```bash
-DB_HOST=<alamat postgres> deploy/helm/migrate-db.sh          # upgrade head
-DB_HOST=<alamat postgres> deploy/helm/migrate-db.sh current  # lihat revisi sekarang
+docker compose --profile migrate run --rm migrate          # VM (deploy/vm), CLOUDSQL_* dari deploy/vm/.env
+deploy/helm/db-job.sh alembic upgrade head                 # GKE: Job, CLOUDSQL_* dari Secret
 ```
 
-Script mengambil `DATABASE_URL` dari Secret release, menggantikan host-nya dengan
-`DB_HOST`, lalu menjalankan Alembic di dalam image `db/Dockerfile`. **Jalankan sebelum**
-men-deploy image yang membutuhkan perubahan tabelnya.
+**Jalankan sebelum** men-deploy image yang membutuhkan perubahan tabelnya. Untuk Postgres biasa yang terjangkau:
+`DB_HOST=<alamat postgres> deploy/helm/migrate-db.sh` (mengambil `DATABASE_URL` dari Secret).
 
 Untuk PostgreSQL lokal, `make up-db` menjalankan migrasi lebih dulu lewat service
 `migrate` di `docker-compose.db.yml`; service lain baru start setelah migrasi selesai.
