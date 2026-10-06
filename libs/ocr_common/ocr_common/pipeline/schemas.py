@@ -24,7 +24,6 @@ class GuardrailsDocument(_Forwarded):
     )
     n_pages: int | None = Field(None, ge=0, description="Halaman yang dinilai", examples=[3])
     threshold: float | None = Field(None, description="Ambang yang dipakai pemeriksaan penentu", examples=[0.47])
-    threshold_target: Literal["accept", "reject"] | None = Field(None, description="Sisi ambang")
 
 
 class GuardrailsPayload(_Forwarded):
@@ -71,7 +70,9 @@ class OcrPayload(_Forwarded):
     """Hasil tahap OCR seperti diterima tahap berikutnya."""
 
     model_config = ConfigDict(
-        json_schema_extra={"description": "Hasil tahap OCR (`ocr_results`), diteruskan ke structuring dan scoring."}
+        json_schema_extra={
+            "description": "Hasil tahap OCR (`nilam_ocr_results`), diteruskan ke structuring dan scoring."
+        }
     )
 
     engine: str | None = Field(None, description="Backend OCR yang membaca dokumen", examples=["rapidocr"])

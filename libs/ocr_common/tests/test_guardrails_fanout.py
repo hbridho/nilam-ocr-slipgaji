@@ -61,7 +61,6 @@ async def test_all_three_pass():
         "confidence": 0.97,
         "n_pages": 1,
         "threshold": 0.47,
-        "threshold_target": "accept",
     }
     assert (report["skipped"], report["unavailable"]) == ([], [])
 
@@ -111,15 +110,15 @@ async def test_fail_closed_raises_instead():
 
 async def test_the_requests_threshold_is_applied_to_the_returned_probability():
     """P(slip gaji) 0.97 passes the service's own 0.47 but not a request asking for 0.99."""
-    report = await _check(_fanout(), thresholds={"identity": {"value": 0.99, "target": "accept"}})
+    report = await _check(_fanout(), thresholds={"identity": 0.99})
     assert (report["passed"], report["rejected_by"]) == (False, "identity")
     assert report["document"]["threshold"] == 0.99
     assert report["checks"]["identity"]["threshold_source"] == "request"
 
 
-async def test_blur_threshold_on_the_reject_side():
-    """p_broken 0.02: rejected only when the request says reject from P(broken) >= 0.01."""
-    lenient = await _check(_fanout(), thresholds={"blur": {"value": 0.5, "target": "reject"}})
-    strict = await _check(_fanout(), thresholds={"blur": {"value": 0.01, "target": "reject"}})
+async def test_blur_threshold_on_the_accept_side():
+    """p_broken 0.02 = P(readable) 0.98: passes 0.5, rejected when the request asks for 0.99."""
+    lenient = await _check(_fanout(), thresholds={"blur": 0.5})
+    strict = await _check(_fanout(), thresholds={"blur": 0.99})
     assert lenient["passed"] is True
     assert (strict["passed"], strict["rejected_by"]) == (False, "blur")

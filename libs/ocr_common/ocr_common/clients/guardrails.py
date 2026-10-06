@@ -15,9 +15,9 @@ They are three services on purpose, and each one can be gone without the others 
 The answers are merged with the precedence blank > blur > identity: on a blank page the blur model also
 says "blur" and the identity model guesses — what the user must be told is "this page is empty".
 
-Every probability is 0-1. The request's own thresholds (`guardrails_confidence_threshold`,
-`guardrails_tendency`, see `ocr_common.thresholds`) are applied here, to the probabilities the services
-return, so the three services stay stateless and need no per-request parameters.
+Every probability is 0-1 and every threshold is on the accept side. The request's own thresholds
+(`guardrails_confidence_threshold`, see `ocr_common.thresholds`) are applied here, to the probabilities the
+services return, so the three services stay stateless and need no per-request parameters.
 """
 
 import asyncio
@@ -64,19 +64,13 @@ def _accept_probability(name: str, report: Mapping[str, Any]) -> float | None:
     return None if value is None else float(value)
 
 
-def apply_threshold(name: str, report: dict[str, Any], threshold: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The report with the request's threshold applied (verdict, passed, reason, threshold fields)."""
+def apply_threshold(name: str, report: dict[str, Any], threshold: float | None) -> dict[str, Any]:
+    """The report with the request's threshold applied: passes when P(accept) >= threshold."""
     accept = _accept_probability(name, report)
     if threshold is None or accept is None:
         return report
     passed = passes(accept, threshold)
-    out = {
-        **report,
-        "passed": passed,
-        "threshold": float(threshold["value"]),
-        "threshold_target": threshold["target"],
-        "threshold_source": "request",
-    }
+    out = {**report, "passed": passed, "threshold": float(threshold), "threshold_source": "request"}
     if name == IDENTITY:
         out.update(
             verdict="slip_gaji" if passed else "bukan_slip_gaji", reason=None if passed else REASON_WRONG_DOCUMENT
@@ -103,10 +97,8 @@ def merge(
     """One document verdict from the checks that answered, in the API spec [07] report shape."""
     identity = reports.get(IDENTITY)
     identity_threshold = None
-    identity_target = None
     if identity is not None:
         identity_threshold = identity.get("threshold", identity.get("reject_threshold"))
-        identity_target = identity.get("threshold_target", "accept")
 
     for name in CHECKS:
         report = reports.get(name)
@@ -121,7 +113,6 @@ def merge(
                     "confidence": _rejection_confidence(name, report),
                     "n_pages": n_pages,
                     "threshold": report.get("threshold", report.get("reject_threshold", report.get("max_chars"))),
-                    "threshold_target": report.get("threshold_target", "accept" if name == IDENTITY else "reject"),
                 },
                 "checks": dict(reports),
                 "skipped": skipped,
@@ -139,7 +130,6 @@ def merge(
             "confidence": None if identity is None else identity.get("proba_slip_gaji"),
             "n_pages": n_pages,
             "threshold": identity_threshold,
-            "threshold_target": identity_target,
         },
         "checks": dict(reports),
         "skipped": skipped,
@@ -172,7 +162,7 @@ class GuardrailsFanout:
         confidence: Mapping[str, Any] | None,
         *,
         n_pages: int,
-        thresholds: Mapping[str, Mapping[str, Any]] | None = None,
+        thresholds: Mapping[str, float] | None = None,
     ) -> dict[str, Any]:
         thresholds = thresholds or {}
         body = {"request_id": request_id, "text": text, "confidence": dict(confidence or {})}

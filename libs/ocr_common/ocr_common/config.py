@@ -1,6 +1,6 @@
 """Settings of every service, read from the environment (and `.env` locally) with pydantic-settings.
 
-`BaseServiceSettings` is what all five services share; `PipelineSettings` adds what the three
+`BaseServiceSettings` is what all seven services share; `PipelineSettings` adds what the three
 asynchronous stages need. Guards on `ENVIRONMENT` make a deployed service refuse to start with a
 laptop-only configuration (mock backends, auth disabled, localhost addresses).
 """
@@ -22,7 +22,9 @@ DEFAULT_MAX_UPLOAD_BYTES = int(2.5 * 1024 * 1024)
 class BaseServiceSettings(BaseSettings):
     """Settings shared by all services: API keys, environment, upload limits, `file_url` policy, logging."""
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
+    # env_ignore_empty: `X=` (an empty variable, as docker compose passes an unset `${X:-}`) means "not set", the
+    # default, rather than an empty string a number or a URL setting would refuse.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True, env_ignore_empty=True)
 
     api_key: str = Field(..., min_length=1)
     api_keys: str = ""
@@ -49,6 +51,29 @@ class BaseServiceSettings(BaseSettings):
     # the `testing_*` tables, without callbacks or writes to the orchestrator's tables. For the ML team's
     # load tests on dev; off everywhere else, and then the routes do not exist.
     testing_endpoints: bool = False
+
+    # Elastic APM (ocr_common/web/apm.py): off, and the agent not even loaded, while ELASTIC_APM_SERVER_URL is unset.
+    # The service name defaults to `ms-bribrain-nilam-ocr-slipgaji-<service>` and the environment to ENVIRONMENT.
+    # The secret token or the API key comes from the Secret, whichever the APM server uses.
+    elastic_apm_server_url: str | None = None
+    elastic_apm_secret_token: str | None = None
+    elastic_apm_api_key: str | None = None
+    elastic_apm_service_name: str | None = None
+    elastic_apm_environment: str | None = None
+    elastic_apm_transaction_sample_rate: float = Field(1.0, ge=0, le=1)
+    elastic_apm_verify_server_cert: bool = True
+
+    # GCP Workload Identity Federation with Entra ID (ocr_common/clients/gcp.py), for the models a service
+    # downloads from GCS at start (*_MODEL_GCS_URI): the names of Tim SEA's guide; the secret comes from the Secret.
+    azure_tenant_id: str | None = None
+    azure_client_id: str | None = None
+    azure_client_secret: str | None = None
+    gcp_project_number: str | None = None
+    gcp_pool_id: str | None = None
+    gcp_provider_id: str | None = None
+    gcp_service_account_email: str | None = None
+    # Where downloaded models go: /tmp is the pod's one writable directory (read-only root filesystem).
+    models_dir: str = "/tmp/models"
 
     @property
     def is_local(self) -> bool:
@@ -98,6 +123,12 @@ class BaseServiceSettings(BaseSettings):
                 f"set the real address when ENVIRONMENT={self.environment}"
             )
 
+    @staticmethod
+    def check_model_uri(uri_name: str, uri: str | None) -> None:
+        """A model from GCS must be a `gs://bucket/path/to/file` URI."""
+        if uri and (not uri.startswith("gs://") or "/" not in uri[5:] or uri.endswith("/")):
+            raise ValueError(f"{uri_name.upper()} must be gs://bucket/path/to/file, not {uri!r}")
+
     def reject_mock_backend_outside_local(self, **backends: str) -> None:
         """Raises when a backend is `mock` outside local: a mock fabricates results."""
         if self.is_local:
@@ -125,6 +156,25 @@ class PipelineSettings(BaseServiceSettings):
     """
 
     database_url: str | None = None
+    # Cloud SQL through the connector, as nilam-ocr-shm (pipeline.cloudsql): set these instead of DATABASE_URL, whose
+    # place the `cloudsql://` URL then takes. Not both. Dev: database `nilam` on
+    # edm-bribrain-dev-01:asia-southeast2:gc-bribrain-dev-sql-psql-01, PRIVATE (port 3307 must be reachable).
+    cloudsql_instance: str = ""
+    cloudsql_database: str = ""
+    cloudsql_ip_type: str = "PRIVATE"
+    # Database login: CLOUDSQL_PASSWORD empty = IAM database authentication (the service account below is the
+    # user); else the database user CLOUDSQL_USER with that password.
+    cloudsql_user: str = ""
+    cloudsql_password: str = Field("", repr=False)
+    # Workload Identity Federation: Entra ID app (client credentials) -> GCP pool/provider -> service account. Its own
+    # app, apart from GCS (AZURE_* / GCP_* of the models) and Bedrock (structuring's LLM).
+    cloudsql_azure_tenant_id: str = ""
+    cloudsql_azure_client_id: str = ""
+    cloudsql_azure_client_secret: str = Field("", repr=False)
+    cloudsql_gcp_project_number: str = ""
+    cloudsql_gcp_pool_id: str = ""
+    cloudsql_gcp_provider_id: str = ""
+    cloudsql_gcp_service_account_email: str = ""
 
     orchestration_url: str | None = None
     orchestration_callback_path: str = "/v1/callbacks/stage"
@@ -135,6 +185,13 @@ class PipelineSettings(BaseServiceSettings):
     # failed at any stage), authenticated with `X-Callback-Key: ORCHESTRATION_CALLBACK_KEY`.
     orchestration_callback_format: Literal["stage", "result"] = "stage"
     orchestration_callback_key: str | None = None
+    # The switch: false = no callback is sent or queued even with ORCHESTRATION_URL set, e.g. while the
+    # central orchestrator has slip gaji in poll mode (it then answers every callback 409 CALLBACK_NOT_EXPECTED
+    # and reads GET /v1/extract-ocr/{request_id} instead).
+    orchestration_callback_enabled: bool = True
+    # How long the outbox keeps retrying a callback (5xx / unreachable). The central orchestrator gives up on a
+    # request a fixed time after its 202 (OCR_CALLBACK_DEADLINE_SECONDS on its side) and refuses later ones.
+    orchestration_callback_max_age_seconds: float = Field(600.0, gt=0)
 
     pipeline_retry_attempts: int = 3
     pipeline_retry_delay_seconds: float = 0.5
@@ -156,27 +213,36 @@ class PipelineSettings(BaseServiceSettings):
 
     @property
     def callbacks_enabled(self) -> bool:
-        """Stage callbacks are only sent when the orchestrator exposes an endpoint for them. The other way
-        to report the outcome is the orchestrator's own tables (ORCHESTRATION_OUTCOME_TABLE,
-        ORCHESTRATION_API_EVENTS_TABLE)."""
-        return bool(self.orchestration_url)
+        """Callbacks are only sent when the orchestrator exposes an endpoint for them and the switch
+        (ORCHESTRATION_CALLBACK_ENABLED) is on. The other ways the outcome reaches the orchestrator are its
+        own tables (ORCHESTRATION_OUTCOME_TABLE, ORCHESTRATION_API_EVENTS_TABLE) and GET
+        /v1/extract-ocr/{request_id}."""
+        return self.orchestration_callback_enabled and bool(self.orchestration_url)
 
     @model_validator(mode="after")
     def _guard_pipeline(self) -> Self:
+        if self.cloudsql_instance:
+            if self.database_url and not self.database_url.startswith("cloudsql://"):
+                raise ValueError("set DATABASE_URL or CLOUDSQL_INSTANCE, not both")
+            from ocr_common.pipeline.cloudsql import config_from, register
+
+            self.database_url = register(config_from(self.model_dump()))
         self.require_outside_local(database_url=self.database_url)
         reports_outcome = (
-            self.orchestration_url or self.orchestration_outcome_table or self.orchestration_api_events_table
+            self.callbacks_enabled or self.orchestration_outcome_table or self.orchestration_api_events_table
         )
-        if not self.is_local and not reports_outcome:
+        # With the switch off on purpose the orchestrator polls GET /v1/extract-ocr/{request_id}.
+        if not self.is_local and self.orchestration_callback_enabled and not reports_outcome:
             raise ValueError(
                 "ORCHESTRATION_URL, ORCHESTRATION_OUTCOME_TABLE or ORCHESTRATION_API_EVENTS_TABLE must be set when "
                 f"ENVIRONMENT={self.environment}: without one, the orchestrator never learns how a request ended "
-                "(set ENVIRONMENT=local for local development)"
+                "(set ORCHESTRATION_CALLBACK_ENABLED=false when it polls instead, or ENVIRONMENT=local for local "
+                "development)"
             )
         self.reject_localhost_outside_local(orchestration_url=self.orchestration_url)
         if (
             self.orchestration_callback_format == "result"
-            and self.orchestration_url
+            and self.callbacks_enabled
             and not self.is_local
             and not self.orchestration_callback_key
         ):

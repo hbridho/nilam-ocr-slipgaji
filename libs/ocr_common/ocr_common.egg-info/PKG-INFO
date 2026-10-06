@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: ocr-common
+Version: 0.1.0
+Summary: Kode bersama untuk service OCR SLIP_GAJI (orchestrator, guardrails, extraction, structuring, scoring)
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.115
+Requires-Dist: pydantic-settings>=2.5
+Requires-Dist: httpx>=0.27
+Requires-Dist: python-multipart>=0.0.9
+Requires-Dist: prometheus-client>=0.21
+Requires-Dist: elastic-apm>=6.26
+Requires-Dist: psutil>=5.9
+Provides-Extra: db
+Requires-Dist: sqlalchemy>=2.0; extra == "db"
+Requires-Dist: greenlet>=3.0; extra == "db"
+Provides-Extra: cloudsql
+Requires-Dist: cloud-sql-python-connector[asyncpg]>=1.22; extra == "cloudsql"
+Provides-Extra: gcs
+Requires-Dist: google-auth[requests]>=2.29; extra == "gcs"

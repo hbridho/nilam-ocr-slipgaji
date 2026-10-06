@@ -10,7 +10,7 @@ field datar. Menggabungkannya akan mencampur komponen satu bulan ke total bulan 
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ocr_common.types import ContractData, ContractField, ContractSlip, FinalResult
+from ocr_common.types import ContractData, ContractField, ContractSlip, FinalResult, FinalSlip
 
 DOCUMENT_TYPE = "slip_gaji"
 # `errors` untuk 400 dokumen yang tidak diterima: oleh model guardrail, atau oleh aturan
@@ -156,26 +156,26 @@ def final_result(
     menggeser skor satu slip ke slip lain tanpa ketahuan.
     """
     by_slip = {entry.get("slip_no"): entry for entry in (scoring.get("slips") or ())}
-    slips = []
+    slips: list[FinalSlip] = []
     for slip in structuring.get("slips") or ():
         number = slip.get("slip_no")
         scored = by_slip.get(number) or {}
         slips.append(
-            {
-                "slip_no": number,
-                "page": slip.get("page"),
-                "fields": dict(slip.get("fields") or {}),
-                "scores": dict(scored.get("scores") or {}),
-                "missing_mandatory_fields": list(slip.get("missing_mandatory_fields") or ()),
-            }
+            FinalSlip(
+                slip_no=number,
+                page=slip.get("page"),
+                fields=dict(slip.get("fields") or {}),
+                scores=dict(scored.get("scores") or {}),
+                missing_mandatory_fields=list(slip.get("missing_mandatory_fields") or ()),
+            )
         )
-    return {
-        "document_type": document_type,
-        "total_slip": len(slips),
-        "slips": slips,
-        "guardrails": guardrails,
-        "llm_used": bool(structuring.get("llm_used")),
-    }
+    return FinalResult(
+        document_type=document_type,
+        total_slip=len(slips),
+        slips=slips,
+        guardrails=guardrails,
+        llm_used=bool(structuring.get("llm_used")),
+    )
 
 
 def empty_slip_values() -> dict[str, None]:

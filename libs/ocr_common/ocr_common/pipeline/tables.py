@@ -1,6 +1,8 @@
 """The tables of this repository, defined once here and used by the services, the Alembic migrations
-and the tests. `orchestration_outcome_table` and `orchestration_api_events_table` describe tables the
-orchestrator owns.
+and the tests. They all live in the schema `PIPELINE_SCHEMA` (`nilam_ocr_slipgaji`), not in `public`, and every name
+starts with `TABLE_PREFIX` (`nilam_`): the callers name a table without it (`ocr`, `testing_`), the prefix is put
+on here.
+`orchestration_outcome_table` and `orchestration_api_events_table` describe tables the orchestrator owns.
 """
 
 from sqlalchemy import (
@@ -10,9 +12,11 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     MetaData,
+    String,
     Table,
     Text,
     func,
@@ -20,16 +24,17 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ENUM
 
-from ocr_common.pipeline.database import JSON_TYPE
+from ocr_common.pipeline.database import JSON_TYPE, PIPELINE_SCHEMA, TABLE_PREFIX
 from ocr_common.testing_endpoints import TESTING_TABLE_PREFIX
 
 PIPELINE_TABLE_PREFIXES = ("ocr", "structuring", "scoring")
 
 
 def pipeline_tables(table_prefix: str, metadata: MetaData) -> tuple[Table, Table]:
-    """The `<prefix>_jobs` and `<prefix>_results` tables of one stage on `metadata`."""
+    """The `nilam_<prefix>_jobs` and `nilam_<prefix>_results` tables of one stage on `metadata`."""
+    jobs_name, results_name = f"{TABLE_PREFIX}{table_prefix}_jobs", f"{TABLE_PREFIX}{table_prefix}_results"
     jobs = Table(
-        f"{table_prefix}_jobs",
+        jobs_name,
         metadata,
         Column("request_id", Text, primary_key=True),
         Column("status", Text, nullable=False),
@@ -39,25 +44,28 @@ def pipeline_tables(table_prefix: str, metadata: MetaData) -> tuple[Table, Table
         Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
         Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
         Column("ds", Text, nullable=False),
-        Index(f"idx_{table_prefix}_jobs_status", "status"),
-        Index(f"idx_{table_prefix}_jobs_ds", "ds"),
+        Index(f"idx_{jobs_name}_status", "status"),
+        Index(f"idx_{jobs_name}_ds", "ds"),
+        schema=PIPELINE_SCHEMA,
     )
     results = Table(
-        f"{table_prefix}_results",
+        results_name,
         metadata,
         Column("request_id", Text, ForeignKey(jobs.c.request_id), primary_key=True),
         Column("result", JSON_TYPE, nullable=False),
         Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
         Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
         Column("ds", Text, nullable=False),
-        Index(f"idx_{table_prefix}_results_ds", "ds"),
+        Index(f"idx_{results_name}_ds", "ds"),
+        schema=PIPELINE_SCHEMA,
     )
     return jobs, results
 
 
 def outbox_table(metadata: MetaData, table_prefix: str = "") -> Table:
-    """The `pipeline_outbox` table shared by the three stages (`testing_pipeline_outbox` with the testing prefix)."""
-    name = f"{table_prefix}pipeline_outbox"
+    """The `nilam_pipeline_outbox` table shared by the three stages (`nilam_testing_pipeline_outbox` with the
+    testing prefix)."""
+    name = f"{TABLE_PREFIX}{table_prefix}pipeline_outbox"
     return Table(
         name,
         metadata,
@@ -88,17 +96,19 @@ def outbox_table(metadata: MetaData, table_prefix: str = "") -> Table:
             sqlite_where=text("failed_at IS NOT NULL"),
         ),
         Index(f"idx_{name}_request_id", "request_id"),
+        schema=PIPELINE_SCHEMA,
     )
 
 
 def guardrails_results_table(metadata: MetaData, table_prefix: str = "") -> Table:
-    """`guardrails_results`: one row per guardrails verdict, written by the orchestrator SLIP_GAJI, the rejected
+    """`nilam_guardrails_results`: one row per guardrails verdict (kept for history; the slip gaji guardrails run
+    in the OCR job and their report is stored with `nilam_ocr_results`), the rejected
     documents included (they never reach a stage table). Append-only: the same request_id sent again is
     judged again. `threshold_source` says whose threshold decided: `request` (the central orchestrator's,
     sent with the request) or `service` (the guardrails service's own). `pipeline_name_sequence` is the
     request's (null: the full pipeline), so the orchestrator's GET can answer a request that never reached a
     stage: guardrails only, or rejected here."""
-    name = f"{table_prefix}guardrails_results"
+    name = f"{TABLE_PREFIX}{table_prefix}guardrails_results"
     return Table(
         name,
         metadata,
@@ -108,7 +118,6 @@ def guardrails_results_table(metadata: MetaData, table_prefix: str = "") -> Tabl
         Column("verdict", Text, nullable=True),
         Column("confidence", Float, nullable=True),
         Column("threshold", Float, nullable=True),
-        Column("threshold_target", Text, nullable=True),
         Column("threshold_source", Text, nullable=False),
         Column("n_pages", Integer, nullable=True),
         Column("reason", Text, nullable=True),
@@ -118,6 +127,7 @@ def guardrails_results_table(metadata: MetaData, table_prefix: str = "") -> Tabl
         Column("ds", Text, nullable=False),
         Index(f"idx_{name}_request_id", "request_id"),
         Index(f"idx_{name}_ds", "ds"),
+        schema=PIPELINE_SCHEMA,
     )
 
 
@@ -174,21 +184,36 @@ def orchestration_api_events_table(name: str) -> Table:
     )
 
 
-def prompts_table(metadata: MetaData) -> Table:
-    """The LLM prompts structuring may read instead of its file (`PROMPT_SOURCE=db`): one row per
-    (name, version), never edited in place — a new prompt is a new row, so every result's `PROMPT_META`
-    still points at the text that produced it. `active=false` keeps a row out of "newest active"."""
+SYSTEM_PROMPT_TABLE = "system_prompt"
+
+
+def system_prompt_table(metadata: MetaData) -> Table:
+    """`system_prompt`: the LLM prompt structuring reads with `PROMPT_SOURCE=db`, in the shape agreed for every
+    NILAM document (team DDL, 6 Oct 2026): one row per version, never edited in place — a new prompt is a new
+    row — and at most one `is_active` row in the table (partial unique index). The name is the team's, without
+    the `nilam_` prefix, so the same SQL works for every document's schema."""
     return Table(
-        "prompts",
+        SYSTEM_PROMPT_TABLE,
         metadata,
-        Column("id", BigInteger, primary_key=True, autoincrement=True),
-        Column("name", Text, nullable=False),
-        Column("version", Integer, nullable=False),
-        Column("body", Text, nullable=False),
-        Column("active", Boolean, nullable=False, server_default=text("true")),
-        Column("note", Text, nullable=True),
+        Column(
+            "version",
+            BigInteger().with_variant(Integer, "sqlite"),
+            Identity(always=True),
+            primary_key=True,
+            autoincrement=True,
+        ),
+        Column("system_prompt", Text, nullable=False),
+        Column("is_active", Boolean, nullable=False, server_default=text("false")),
+        Column("change_note", String(100), nullable=True),
         Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
-        Index("uq_prompts_name_version", "name", "version", unique=True),
+        Index(
+            "uq_system_prompt_active",
+            text("(is_active)"),
+            unique=True,
+            postgresql_where=text("is_active = TRUE"),
+            sqlite_where=text("is_active = 1"),
+        ),
+        schema=PIPELINE_SCHEMA,
     )
 
 
@@ -202,5 +227,5 @@ def repo_metadata() -> MetaData:
             pipeline_tables(f"{lane_prefix}{table_prefix}", metadata)
         outbox_table(metadata, lane_prefix)
         guardrails_results_table(metadata, lane_prefix)
-    prompts_table(metadata)
+    system_prompt_table(metadata)
     return metadata

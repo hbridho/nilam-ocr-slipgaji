@@ -61,7 +61,7 @@ def build_stage_pipeline(
     """The `StagePipeline` of a service from its settings: callback client, outbox, repository, outcome row.
 
     `testing=True` builds the pipeline behind the `-test` endpoints: the same work on the `testing_*` tables
-    and `testing_pipeline_outbox`, with no callback and no write to the orchestrator's tables, so a load test
+    and `nilam_testing_pipeline_outbox`, with no callback and no write to the orchestrator's tables, so a load test
     never reaches the orchestrator. `next_stage` must then point at the next stage's `-test` endpoint."""
     lane_prefix = TESTING_TABLE_PREFIX if testing else ""
     outbox = None
@@ -109,6 +109,7 @@ def build_outbox_relay(settings: PipelineSettings, pipeline: StagePipeline) -> O
         retry_delay_seconds=settings.pipeline_retry_delay_seconds,
         max_backoff_seconds=settings.pipeline_outbox_max_backoff_seconds,
         max_age_seconds=settings.pipeline_outbox_max_age_seconds,
+        callback_max_age_seconds=settings.orchestration_callback_max_age_seconds,
         stale_after_seconds=settings.pipeline_outbox_stale_after_seconds,
         metrics_stage=pipeline.metrics_stage,
     )

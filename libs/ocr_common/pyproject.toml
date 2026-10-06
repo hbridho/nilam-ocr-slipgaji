@@ -13,10 +13,17 @@ dependencies = [
     "httpx>=0.27",
     "python-multipart>=0.0.9",
     "prometheus-client>=0.21",
+    # Elastic APM (ocr_common/web/apm.py), only loaded with ELASTIC_APM_SERVER_URL; psutil gives it CPU and memory.
+    "elastic-apm>=6.26",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
 db = ["sqlalchemy>=2.0", "greenlet>=3.0"]
+# Cloud SQL with IAM database authentication: a DATABASE_URL with `cloudsql_instance` (pipeline/database.py).
+cloudsql = ["cloud-sql-python-connector[asyncpg]>=1.22"]
+# Models downloaded from GCS at start (clients/gcs.py, clients/models.py) with Entra ID workload identity (clients/gcp.py).
+gcs = ["google-auth[requests]>=2.29"]
 
 [tool.setuptools.packages.find]
 include = ["ocr_common*"]

@@ -105,11 +105,11 @@ def test_the_result_callback_completes_on_the_final_stage_with_its_result_as_it_
     not_final = stage_callback_body("REQ", "OCR", "DONE", result=ocr)
 
     assert final["final"] is True and "final" not in not_final
-    assert result_callback_body(final) == {"request_id": "REQ", "status": "completed", "result": ocr, "guardrails": {}}
+    assert result_callback_body(final) == {"request_id": "REQ", "status": "completed", "result": ocr, "guardrails": 0}
     assert result_callback_body(not_final) is None
 
 
-def test_the_scoring_callback_carries_0_1_probabilities_per_slip():
+def test_a_scoring_callback_queued_before_the_final_flag_still_completes_with_0_1_data():
     body = stage_callback_body(
         "REQ",
         "SCORING",
@@ -131,9 +131,9 @@ def test_the_scoring_callback_carries_0_1_probabilities_per_slip():
 
     assert completed is not None and completed["status"] == "completed"
     [slip] = completed["result"]["slip"]
-    assert slip["gaji_pokok"] == {"value": 4500000, "confidence": 0.9361}
-    assert slip["bonus"] == {"value": None, "confidence": 0.0}
-    assert completed["guardrails"] == {"passed": True}
+    assert slip["gaji_pokok"] == {"value": 4500000, "confidence": 1}
+    assert slip["bonus"] == {"value": None, "confidence": 0}
+    assert completed["guardrails"] == 0
 
 
 async def test_a_job_record_carries_the_sequence_it_was_submitted_with():

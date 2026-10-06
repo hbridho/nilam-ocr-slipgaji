@@ -5,12 +5,26 @@ hand-off to the next stage. `with_retry` is the retry policy of the direct (non-
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
-from ocr_common.clients.remote import RemoteModelClient
+from ocr_common.clients.remote import RemoteClientError, RemoteModelClient
 from ocr_common.errors import ServiceError
+from ocr_common.slip_gaji import REJECTED_CODE, contract_data
+from ocr_common.types import FinalResult
 
 logger = logging.getLogger(__name__)
+
+# The central orchestrator answers a result callback that arrives before it recorded its 202 for the
+# request with 409 RESULT_NOT_READY; its contract (2 Oct 2026) says to send it again after 1-2 s, at
+# most 5 times. Every other 4xx is final.
+RESULT_NOT_READY = "RESULT_NOT_READY"
+NOT_READY_RETRIES = 5
+NOT_READY_DELAY_SECONDS = 1.5
+
+
+def not_ready(exc: ServiceError) -> bool:
+    """The central orchestrator has not recorded the request's 202 yet: send the callback again shortly."""
+    return isinstance(exc, RemoteClientError) and exc.status_code == 409 and exc.remote_code == RESULT_NOT_READY
 
 
 async def with_retry(call: Callable[[], Awaitable[Any]], attempts: int, delay: float) -> Any:
@@ -39,6 +53,7 @@ class StageCallback(Protocol):
         error_message: str | None = None,
         error_code: str | None = None,
         final: bool = False,
+        answer: dict[str, Any] | None = None,
     ) -> bool:
         """Direct mode: build and send the callback with retries; returns False when it was skipped or gave up."""
         ...
@@ -77,11 +92,16 @@ def stage_callback_body(
     error_message: str | None = None,
     error_code: str | None = None,
     final: bool = False,
+    answer: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The per-stage callback body. `error_code` is only present when set: `DOWNSTREAM_VALIDATION_ERROR`
     on a rejection, so a FAILED callback tells a rejected document from a stage that broke. `final: true`
     is only present on the DONE of the stage that ends the request (the last of its
-    pipeline_name_sequence), whose `result` is then the request's answer."""
+    pipeline_name_sequence), whose `result` is then the request's answer.
+
+    `answer`, only on that final DONE, is the `data` the orchestrator's `extract-ocr` 200 answers with for
+    this request (scoring: the 0/1 confidences decided with the request's thresholds). It is kept for the
+    result callback, which must carry exactly that; the per-stage callback leaves it out."""
     body: dict[str, Any] = {
         "request_id": request_id,
         "stage": stage,
@@ -93,7 +113,13 @@ def stage_callback_body(
         body["error_code"] = error_code
     if final:
         body["final"] = True
+    if answer is not None:
+        body["answer"] = answer
     return body
+
+
+def _without_answer(body: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in body.items() if key != "answer"}
 
 
 class OrchestrationCallback:
@@ -115,9 +141,10 @@ class OrchestrationCallback:
         error_message: str | None = None,
         error_code: str | None = None,
         final: bool = False,
+        answer: dict[str, Any] | None = None,
     ) -> bool:
         """Send `{request_id, stage, status, result, error_message[, error_code]}` with retries; False when
-        skipped or failed."""
+        skipped or failed. `answer` is only for the result callback and is not sent."""
         if self._client is None:
             logger.info("callback skipped (ORCHESTRATION_URL not set): %s %s %s", request_id, stage, status)
             return False
@@ -137,7 +164,7 @@ class OrchestrationCallback:
         if self._client is None:
             logger.info("callback skipped (ORCHESTRATION_URL not set): %s", body.get("request_id"))
             return
-        await self._client.post_json(self._path, body)
+        await self._client.post_json(self._path, _without_answer(body))
 
     async def aclose(self) -> None:
         """Close the HTTP client, if any."""
@@ -148,78 +175,86 @@ class OrchestrationCallback:
 RESULT_COMPLETED = "completed"
 RESULT_FAILED = "failed"
 _FINAL_STAGE = "SCORING"
+# `guardrails` of the result callback, as in the extract-ocr answer: 1 = rejected, 0 = passed.
+GUARDRAILS_PASSED = 0
+GUARDRAILS_REJECTED = 1
+# FIELD_CONFIDENCE_THRESHOLD's default: only for a SCORING body queued before `answer` existed.
+_LEGACY_THRESHOLD = 0.5
 
 
 def result_callback_body(stage_body: dict[str, Any]) -> dict[str, Any] | None:
-    """The orchestrator's result callback (`ORCHESTRATION_CALLBACK_FORMAT=result`) for a per-stage callback
-    body, or None when that stage event is not the end of the request.
+    """The central orchestrator's result callback (`ORCHESTRATION_CALLBACK_FORMAT=result`, its contract
+    "Callback Hasil OCR" of 2 Oct 2026) for a per-stage callback body, or None when that stage event
+    is not the end of the request.
 
-    Completed (SCORING `DONE`, `result` = the final result)::
+    Completed (DONE of the stage that ends the request: scoring, or the last of a shorter
+    pipeline_name_sequence). `result` is exactly the `data` the extract-ocr 200 answers with for the
+    same request (scoring: `{total_slip, slip[]}` with 0/1 confidences decided with the request's
+    `column_confidence_threshold`; an earlier stage: its result as it is)::
 
-        {"request_id", "status": "completed",
-         "result": {"total_slip": int,
-                    "slip": [{"page": int, "<field>": {"value": Any, "confidence": float}, ...,
-                              "missing_mandatory_fields": [str]}]},
-         "guardrails": {...laporan guardrail...}}
+        {"request_id", "status": "completed", "result": {...}, "guardrails": 0}
 
-    Satu dokumen bisa berisi beberapa slip (tiga bulan dalam satu berkas adalah bentuk yang paling sering
-    diunggah), jadi hasilnya array, bukan satu himpunan field datar.
+    Rejected by a guardrail or by the structuring rules (a FAILED with `DOWNSTREAM_VALIDATION_ERROR`): the
+    orchestrator recognises a rejection by `result: null` with `guardrails: 1`, and passes `message` to its
+    client::
 
-    `confidence` di sini probabilitas mentah 0-1 dari model keyakinan, BUKAN 0/1 seperti di kontrak
-    `extract-ocr` (API spec [07]: "callback dan internal: float 0-1"). Field tanpa nilai bernilai null
-    dengan confidence 0.0.
+        {"request_id", "status": "completed", "result": null, "guardrails": 1,
+         "message": "<the rules' reason>", "error_code": "DOWNSTREAM_VALIDATION_ERROR"}
 
-    Ended early (`pipeline_name_sequence` berhenti sebelum scoring; DONE tahap itu membawa `final: true`):
-    `result` adalah hasil tahap terakhir apa adanya, dan `guardrails` `{}`.
+    Failed (any other FAILED)::
 
-    Failed (tahap mana pun `FAILED`, termasuk penolakan)::
+        {"request_id", "status": "failed", "error_code": "<STAGE>_FAILED", "message": str}
 
-        {"request_id", "status": "failed", "result": null, "guardrails": {},
-         "error_code": "<STAGE>_FAILED" | "DOWNSTREAM_VALIDATION_ERROR", "error_message": str}
-    """
+    `error_code` is outside the contract: the orchestrator ignores it for now and plans to pass it on
+    like the synchronous answer does."""
     request_id, stage, status = stage_body["request_id"], stage_body["stage"], stage_body["status"]
+    error_code = stage_body.get("error_code")
+    message = stage_body.get("error_message")
+    if status == "FAILED" and error_code == REJECTED_CODE:
+        return {
+            "request_id": request_id,
+            "status": RESULT_COMPLETED,
+            "result": None,
+            "guardrails": GUARDRAILS_REJECTED,
+            "message": message,
+            "error_code": REJECTED_CODE,
+        }
     if status == "FAILED":
         return {
             "request_id": request_id,
             "status": RESULT_FAILED,
-            "result": None,
-            "guardrails": {},
-            "error_code": stage_body.get("error_code") or f"{stage}_FAILED",
-            "error_message": stage_body.get("error_message"),
+            "error_code": error_code or f"{stage}_FAILED",
+            "message": message,
         }
-    final = stage_body.get("result")
-    if status != "DONE" or not final:
+    # A body without `final` was queued before pipeline_name_sequence existed: only SCORING ended a request.
+    ends_request = stage_body.get("final", stage == _FINAL_STAGE)
+    if status != "DONE" or not ends_request:
+        return None
+    answer = stage_body.get("answer")
+    if answer is None:
+        answer = _legacy_answer(stage, stage_body.get("result"))
+    if answer is None:
+        return None
+    return {"request_id": request_id, "status": RESULT_COMPLETED, "result": answer, "guardrails": GUARDRAILS_PASSED}
+
+
+def _legacy_answer(stage: str, final: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The answer of a DONE body queued before `answer` existed: an earlier stage's result as it is; for
+    scoring, the 0/1 confidences decided with FIELD_CONFIDENCE_THRESHOLD's default (the request's own
+    thresholds were not kept with the body)."""
+    if not final:
         return None
     if stage != _FINAL_STAGE:
-        if not stage_body.get("final"):
-            return None
-        return {"request_id": request_id, "status": RESULT_COMPLETED, "result": final, "guardrails": {}}
-    slips = []
-    for slip in final.get("slips") or ():
-        values = slip.get("fields") or {}
-        scores = slip.get("scores") or {}
-        entry: dict[str, Any] = {"page": slip.get("page")}
-        for name, value in values.items():
-            found = value is not None and str(value).strip() != ""
-            entry[name] = {
-                "value": value if found else None,
-                "confidence": round(float(scores.get(name) or 0.0), 4) if found else 0.0,
-            }
-        entry["missing_mandatory_fields"] = list(slip.get("missing_mandatory_fields") or ())
-        slips.append(entry)
-    return {
-        "request_id": request_id,
-        "status": RESULT_COMPLETED,
-        "result": {"total_slip": len(slips), "slip": slips},
-        "guardrails": final.get("guardrails") or {},
-    }
+        return final
+    return dict(contract_data(cast(FinalResult, final), _LEGACY_THRESHOLD))
 
 
 class ResultCallback:
     """The orchestrator's single result callback (`ORCHESTRATION_CALLBACK_FORMAT=result`): one POST per
-    request when it ends, completed by scoring or failed at any stage. It takes the same per-stage events
-    as `OrchestrationCallback` (so the pipeline and the outbox are unchanged) and turns them into that
-    body; the events that do not end a request (OCR / STRUCTURING `DONE`) are skipped."""
+    request when it ends, completed by the last stage of its pipeline_name_sequence, rejected, or failed
+    at any stage. It takes the same per-stage events as `OrchestrationCallback` (so the pipeline and the
+    outbox are unchanged) and turns them into that body; the events that do not end a request (a `DONE`
+    without `final`) are skipped."""
 
     def __init__(self, client: RemoteModelClient | None, path: str, *, attempts: int = 3, delay: float = 0.5):
         self._client = client
@@ -237,8 +272,10 @@ class ResultCallback:
         error_message: str | None = None,
         error_code: str | None = None,
         final: bool = False,
+        answer: dict[str, Any] | None = None,
     ) -> bool:
-        """Send the result callback with retries; False when this event is not final, or when it failed."""
+        """Send the result callback with retries (5xx, and a 409 RESULT_NOT_READY a few times); False when
+        this event is not final, or when it failed."""
         body = result_callback_body(
             stage_callback_body(
                 request_id,
@@ -248,6 +285,7 @@ class ResultCallback:
                 error_message=error_message,
                 error_code=error_code,
                 final=final,
+                answer=answer,
             )
         )
         if body is None:
@@ -257,7 +295,14 @@ class ResultCallback:
             return False
         client = self._client
         try:
-            await with_retry(lambda: client.post_json(self._path, body), self._attempts, self._delay)
+            for retry in range(NOT_READY_RETRIES + 1):
+                try:
+                    await with_retry(lambda: client.post_json(self._path, body), self._attempts, self._delay)
+                    break
+                except ServiceError as exc:
+                    if not not_ready(exc) or retry == NOT_READY_RETRIES:
+                        raise
+                    await asyncio.sleep(NOT_READY_DELAY_SECONDS)
         except ServiceError as exc:
             logger.error("result callback failed: %s %s: %s", request_id, body["status"], exc.message)
             return False

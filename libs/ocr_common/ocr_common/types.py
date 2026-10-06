@@ -45,7 +45,7 @@ class OcrEngineResult(TypedDict):
 
 
 class OcrResult(OcrEngineResult):
-    """Hasil tersimpan tahap OCR (`ocr_results.result`), diteruskan ke structuring dan scoring."""
+    """Hasil tersimpan tahap OCR (`nilam_ocr_results.result`), diteruskan ke structuring dan scoring."""
 
     engine: str
     elapsed_ms: float
@@ -98,6 +98,8 @@ class ScoringResult(TypedDict):
     slips: list[SlipScores]
     threshold: float
     model: NotRequired[str | None]
+    # The request's per-field thresholds, kept with the result so its GET answers like the POST did.
+    column_confidence_threshold: NotRequired[dict[str, float] | None]
 
 
 class FinalSlip(TypedDict):
