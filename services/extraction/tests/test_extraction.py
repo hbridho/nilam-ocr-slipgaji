@@ -13,7 +13,7 @@ from ocr_common.testing import image_upload
 
 from app.config import Settings
 from app.ml.mock import MockOcrEngine
-from app.services.extraction_service import ExtractionService, ocr_summary
+from app.services.extraction_service import ExtractionService, accept_thresholds, ocr_summary
 
 SETTINGS = Settings(api_key="x", _env_file=None)
 SLIP_PAGE = "SLIP GAJI\nPeriode  : Februari 2025\nGaji Pokok  Rp 4.500.000"
@@ -89,7 +89,7 @@ async def test_pages_are_kept_apart_not_merged():
 async def test_the_guardrail_sees_the_ocr_text_the_quality_summary_and_the_thresholds():
     """Ringkasan mutu OCR ikut dikirim: tanpa itu gerbang blur hanya bisa melihat panjang teks."""
     guardrails = StubGuardrails()
-    thresholds = {"identity": {"value": 0.8, "target": "accept"}}
+    thresholds = {"identity": 0.8, "blur": 0.7}
 
     result = await _service(guardrails=guardrails).extract(
         "slip.pdf", "application/pdf", b"%PDF-1.4", request_id="R1", guardrail_thresholds=thresholds
@@ -101,6 +101,14 @@ async def test_the_guardrail_sees_the_ocr_text_the_quality_summary_and_the_thres
     assert seen_thresholds == thresholds
     assert result["guardrails"]["verdict"] == "slip_gaji"
     assert result.get("reject_reason") is None
+
+
+def test_a_job_stored_before_the_object_form_keeps_its_thresholds():
+    """Job lama yang dijalankan ulang setelah rilis: `{value, target}` menjadi ambang sisi accept."""
+    old = {"identity": {"value": 0.8, "target": "accept"}, "blur": {"value": 0.25, "target": "reject"}}
+    assert accept_thresholds(old) == {"identity": 0.8, "blur": 0.75}
+    assert accept_thresholds({"identity": 0.6}) == {"identity": 0.6}
+    assert accept_thresholds(None) is None
 
 
 async def test_the_quality_summary_is_aggregated_over_pages():

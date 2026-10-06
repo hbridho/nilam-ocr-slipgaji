@@ -36,9 +36,6 @@ class GuardrailDocument(BaseModel):
     )
     n_pages: int = Field(0, ge=0, description="Halaman yang dinilai", examples=[3])
     threshold: float | None = Field(None, description="Ambang yang dipakai pemeriksaan penentu", examples=[0.47])
-    threshold_target: Literal["accept", "reject"] | None = Field(
-        None, description="Sisi ambang: `accept` lolos bila P(accept) >= ambang; `reject` sebaliknya"
-    )
 
 
 class GuardrailReport(BaseModel):

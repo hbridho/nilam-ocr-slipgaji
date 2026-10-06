@@ -36,7 +36,6 @@ OCR_RESULT_EXAMPLE = {
             "confidence": 0.9934,
             "n_pages": 3,
             "threshold": 0.47,
-            "threshold_target": "accept",
         },
         "checks": {
             "blank": {

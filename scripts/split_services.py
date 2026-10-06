@@ -84,6 +84,29 @@ pipelines:
 """
 
 
+# SonarQube (SAST) of each Bitbucket repo: the BRI template of the NILAM repos (nilam-ocr-npwp), per service. The
+# pipeline checks the repo out into `code/` and runs the scanner next to it, hence `../code`. Everything is scanned.
+SONAR = """# must be unique in a given SonarQube instance
+sonar.projectKey=bribrain:{repo}:development
+# this is the name and version displayed in the SonarQube UI. Was mandatory prior to SonarQube 6.1.
+sonar.projectName={repo}
+sonar.projectVersion=1.0
+
+# Path is relative to the sonar-project.properties file. Replace "\\" by "/" on Windows.
+# This property is optional if sonar.moduleonfigs set.
+sonar.sources=../code
+sonar.projectBaseDir=../code
+
+sonar.lang.patterns.xml=browserconfig.xml
+sonar.flow.file.suffixes=xml
+sonar.python.version=3.11
+# sonar.exclusions=../code/vendor/*
+
+# Encoding of the source code. Default is default system encoding
+sonar.sourceEncoding=UTF-8
+"""
+
+
 def readme(name: str, repo: str, port: int, what: str, libs: list[str]) -> str:
     return f"""# {repo}
 
@@ -133,6 +156,7 @@ def main() -> None:
         pyproject.write_text(text, encoding="utf-8")
         (target / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
         (target / "README.md").write_text(readme(name, repo, port, what, libs), encoding="utf-8")
+        (target / "sonar-project.properties").write_text(SONAR.format(repo=repo), encoding="utf-8", newline="\n")
         (target / "bitbucket-pipelines.yml").write_text(
             PIPELINE.format(libs=" ".join(f"./{lib}" for lib in libs), repo=repo), encoding="utf-8"
         )

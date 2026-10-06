@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: slip-ml
+Version: 1.0.0
+Summary: Pipeline OCR slip gaji dan model guardrail/keyakinan, dipakai bersama oleh service nilam-ocr-slip-gaji
+Requires-Python: >=3.11
+Requires-Dist: numpy>=1.26
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: PyMuPDF>=1.24
+Requires-Dist: Pillow>=10.0
+Requires-Dist: requests>=2.31
+Provides-Extra: ocr
+Requires-Dist: rapidocr-onnxruntime>=1.3; extra == "ocr"
+Requires-Dist: onnxruntime>=1.17; extra == "ocr"
+Provides-Extra: pixel
+Requires-Dist: opencv-python-headless>=4.9; extra == "pixel"
+Requires-Dist: pypdfium2>=4.30; extra == "pixel"
+Provides-Extra: llm
+Requires-Dist: boto3>=1.34; extra == "llm"

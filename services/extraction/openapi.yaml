@@ -389,7 +389,6 @@ paths:
                             confidence: 0.9934
                             n_pages: 3
                             threshold: 0.47
-                            threshold_target: accept
                           checks:
                             blank:
                               check: blank
@@ -481,9 +480,9 @@ paths:
       summary: Backlog of this stage's undelivered callbacks and hand-offs
       description: 'Operational view of the transactional outbox (`PIPELINE_OUTBOX`): how many callbacks
         and hand-offs of this stage are still to be delivered, how old the oldest one is, and how many
-        were given up on (dead letters). No other service watches the `pipeline_outbox` table, so this
-        is where a monitor should look; the relay also logs a warning when the backlog is older than `PIPELINE_OUTBOX_STALE_AFTER_SECONDS`
-        or a dead letter is waiting.'
+        were given up on (dead letters). No other service watches the `nilam_pipeline_outbox` table, so
+        this is where a monitor should look; the relay also logs a warning when the backlog is older than
+        `PIPELINE_OUTBOX_STALE_AFTER_SECONDS` or a dead letter is waiting.'
       operationId: getExtractionOutboxStatus
       responses:
         '200':
@@ -706,7 +705,6 @@ paths:
                           confidence: 0.9934
                           n_pages: 3
                           threshold: 0.47
-                          threshold_target: accept
                         checks:
                           blank:
                             check: blank
@@ -929,8 +927,8 @@ components:
           - type: string
           - type: 'null'
           title: Guardrails Confidence Threshold
-          description: 'Ambang guardrail permintaan ini dalam bentuk ternormalisasi orchestrator: `{"identity":
-            {"value": 0.8, "target": "accept"}, "blur": {...}}`'
+          description: 'Ambang guardrail permintaan ini (sisi accept), sudah diperiksa dan dinormalkan
+            orchestrator: `{"identity": 0.8, "blur": 0.7}`'
         column_confidence_threshold:
           anyOf:
           - type: string
@@ -1084,15 +1082,6 @@ components:
           description: Ambang yang dipakai pemeriksaan penentu
           examples:
           - 0.47
-        threshold_target:
-          anyOf:
-          - type: string
-            enum:
-            - accept
-            - reject
-          - type: 'null'
-          title: Threshold Target
-          description: 'Sisi ambang: `accept` lolos bila P(accept) >= ambang; `reject` sebaliknya'
       type: object
       required:
       - verdict
@@ -1366,9 +1355,12 @@ components:
             type: object
           - type: 'null'
           title: Column Confidence Threshold
-          description: The request's per-field thresholds (0-1); null when not sent
+          description: 'The central orchestrator''s per-field thresholds (0-1) the job was submitted with
+            (an `all_field` it sent is already spread over the 20 slip fields); null when none were given:
+            `FIELD_CONFIDENCE_THRESHOLD` for every field'
           examples:
-          - null
+          - gaji_bersih: 0.9
+            gaji_pokok: 0.9
         result:
           anyOf:
           - $ref: '#/components/schemas/OcrResult'
@@ -1638,8 +1630,8 @@ components:
           type: integer
           title: Dead Letters
           description: Messages given up on (a 4xx from the receiver, or 5xx for longer than `PIPELINE_OUTBOX_MAX_AGE_SECONDS`).
-            They stay in `pipeline_outbox` with `failed_at` and `last_error` for inspection and are never
-            retried; anything above 0 needs a human
+            They stay in `nilam_pipeline_outbox` with `failed_at` and `last_error` for inspection and
+            are never retried; anything above 0 needs a human
           examples:
           - 0
       type: object

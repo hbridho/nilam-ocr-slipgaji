@@ -33,7 +33,6 @@ ENVELOPE = {
     "request_id",
     "guardrails",
     "pipeline_last_stage",
-    "params",
 }
 FAILURES: list[str] = []
 
@@ -129,8 +128,8 @@ def main() -> int:
         fields = [value for value in slips[0].values() if isinstance(value, dict)]
         check("every field is {value, confidence 0/1}", fields and all(f.get("confidence") in (0, 1) for f in fields))
     check(
-        "guardrails 0 and pipeline_last_stage scoring",
-        (body.get("guardrails"), body.get("pipeline_last_stage")) == (0, "scoring"),
+        "guardrails 0 and pipeline_last_stage null (API spec [07]: null on 200)",
+        (body.get("guardrails"), body.get("pipeline_last_stage")) == (0, None),
         str((body.get("guardrails"), body.get("pipeline_last_stage"))),
     )
 
@@ -142,7 +141,7 @@ def main() -> int:
         (["extraction", "structuring", "scoring"], "scoring", {"total_slip", "slip"}),
     ]:
         status, body = submit(document, pipeline_name_sequence=json.dumps(sequence))
-        ok = status == 200 and body.get("pipeline_last_stage") == last and keys <= set(body.get("data") or {})
+        ok = status == 200 and body.get("pipeline_last_stage") is None and keys <= set(body.get("data") or {})
         check(f"{sequence} -> data of {last}", ok, f"{status} {body.get('pipeline_last_stage')} {body.get('message')}")
         if sequence == ["guardrails"] and body.get("data"):
             report = body["data"]
@@ -156,9 +155,9 @@ def main() -> int:
     slips = (body.get("data") or {}).get("slip") or []
     strict = slips and all(v["confidence"] == 0 for v in slips[0].values() if isinstance(v, dict))
     check("column_confidence_threshold all_field 0.999 -> every confidence 0", status == 200 and bool(strict))
-    status, body = submit(document, guardrails_confidence_threshold="0.9999", guardrails_tendency="accepted")
+    status, body = submit(document, guardrails_confidence_threshold='{"acc_rej": 0.9999}')
     check(
-        "guardrails threshold 0.9999 -> 400 DOWNSTREAM_VALIDATION_ERROR from guardrails or 200",
+        "guardrails threshold {acc_rej: 0.9999} -> 400 DOWNSTREAM_VALIDATION_ERROR from guardrails or 200",
         status in (200, 400) and (status == 200 or body.get("pipeline_last_stage") == "guardrails"),
         f"{status} {body.get('message')}",
     )
@@ -167,7 +166,8 @@ def main() -> int:
     for name, fields, code in [
         ("invalid sequence", {"pipeline_name_sequence": '["extraction","scoring"]'}, "INVALID_PIPELINE_SEQUENCE"),
         ("invalid threshold", {"column_confidence_threshold": '{"nomor_npwp": 0.5}'}, "INVALID_THRESHOLD"),
-        ("invalid params", {"params": "{bad"}, "INVALID_PARAMS"),
+        ("bare-number guardrails threshold", {"guardrails_confidence_threshold": "0.5"}, "INVALID_THRESHOLD"),
+        ("unknown guardrail", {"guardrails_confidence_threshold": '{"accept": 0.5}'}, "INVALID_THRESHOLD"),
         ("wrong document_type", {"document_type": "npwp"}, "UNSUPPORTED_DOCUMENT_TYPE"),
     ]:
         status, body = call("POST", "/v1/extract-ocr", {"request_id": "SMOKE_REFUSE", **fields}, document)

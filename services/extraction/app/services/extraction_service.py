@@ -39,6 +39,23 @@ def ocr_summary(pages: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def accept_thresholds(stored: Mapping[str, Any] | None) -> dict[str, float] | None:
+    """Ambang per guardrail `{nama: x}` (sisi accept) dari input job. Job yang disimpan sebelum format objek
+    (6 Okt 2026) membawa `{nama: {"value": x, "target": "accept" | "reject"}}`; job itu masih bisa
+    dijalankan ulang setelah rilis, jadi bentuk lama diterjemahkan: target reject x = accept 1 - x."""
+    if not stored:
+        return None
+    thresholds = {}
+    for name, value in stored.items():
+        if isinstance(value, Mapping):
+            old = value.get("value")
+            if old is None:
+                continue
+            value = 1 - float(old) if value.get("target") == "reject" else old
+        thresholds[name] = float(value)
+    return thresholds or None
+
+
 class ExtractionService:
     """Tahap OCR: baca dokumen, lalu — bila `guardrails` ada di `pipeline_name_sequence` — minta ketiga
     guardrail menilai teksnya, bersamaan.
@@ -61,7 +78,7 @@ class ExtractionService:
         *,
         request_id: str = "",
         run_guardrails: bool = True,
-        guardrail_thresholds: Mapping[str, Mapping[str, Any]] | None = None,
+        guardrail_thresholds: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         validate_image(content_type, content, self._settings)
         result: dict[str, Any] = dict(await run_in_threadpool(self._engine.read, filename, content))
@@ -75,7 +92,7 @@ class ExtractionService:
             result.get("full_text") or "",
             ocr_summary(result.get("pages") or []),
             n_pages=len(result.get("pages") or ()),
-            thresholds=guardrail_thresholds,
+            thresholds=accept_thresholds(guardrail_thresholds),
         )
         result["guardrails"] = report
         if not report.get("passed", True):
