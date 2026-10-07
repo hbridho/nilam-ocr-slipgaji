@@ -25,6 +25,7 @@ ocr_common/clients/models.py
 ocr_common/clients/remote.py
 ocr_common/pipeline/__init__.py
 ocr_common/pipeline/callbacks.py
+ocr_common/pipeline/cloudsql.py
 ocr_common/pipeline/database.py
 ocr_common/pipeline/factory.py
 ocr_common/pipeline/metrics.py
@@ -61,6 +62,7 @@ tests/test_cloudsql.py
 tests/test_column_thresholds.py
 tests/test_config.py
 tests/test_content_types.py
+tests/test_empty_env.py
 tests/test_fetch_url.py
 tests/test_gateway_spec.py
 tests/test_gcs_models.py

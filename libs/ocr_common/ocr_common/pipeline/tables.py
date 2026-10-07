@@ -101,19 +101,25 @@ def outbox_table(metadata: MetaData, table_prefix: str = "") -> Table:
 
 
 def guardrails_results_table(metadata: MetaData, table_prefix: str = "") -> Table:
-    """`nilam_guardrails_results`: one row per guardrails verdict (kept for history; the slip gaji guardrails run
-    in the OCR job and their report is stored with `nilam_ocr_results`), the rejected
-    documents included (they never reach a stage table). Append-only: the same request_id sent again is
-    judged again. `threshold_source` says whose threshold decided: `request` (the central orchestrator's,
-    sent with the request) or `service` (the guardrails service's own). `pipeline_name_sequence` is the
-    request's (null: the full pipeline), so the orchestrator's GET can answer a request that never reached a
-    stage: guardrails only, or rejected here."""
+    """`nilam_guardrails_results`: the answer of each guardrail, one row per `guardrail` (`blank`, `blur`,
+    `identity`) every time the OCR job judges a document (migration 0011), the rejected documents included.
+    Written by extraction, which runs the three guardrails after OCR (`app/services/guardrails_log.py`); the merged
+    report is also stored with `nilam_ocr_results`. Append-only: the same request_id sent again is judged again.
+
+    `passed`/`verdict`/`reason` are the guardrail's own; a guardrail switched off or not answering still gets its row,
+    `verdict` `skipped` or `unavailable` (`passed` true: it held nothing back). `confidence` and `threshold` are on
+    the accept side, so `passed` = `confidence >= threshold` (null for `blank`, a rule on the text length; its
+    `chars`/`max_chars` are in `report`, the guardrail's answer as it decided). `threshold_source` says whose
+    threshold decided: `request` (the central orchestrator's, sent with the request) or `service` (the guardrail's
+    own). `pipeline_name_sequence` is the request's (null: the full pipeline). Rows written before 0011 have no
+    `guardrail`: one row per merged verdict."""
     name = f"{TABLE_PREFIX}{table_prefix}guardrails_results"
     return Table(
         name,
         metadata,
         Column("id", BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True),
         Column("request_id", Text, nullable=False),
+        Column("guardrail", Text, nullable=True),
         Column("passed", Boolean, nullable=False),
         Column("verdict", Text, nullable=True),
         Column("confidence", Float, nullable=True),

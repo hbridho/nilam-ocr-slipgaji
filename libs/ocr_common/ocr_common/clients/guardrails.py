@@ -52,8 +52,9 @@ class GuardrailEndpoint:
     client: RemoteModelClient | None
 
 
-def _accept_probability(name: str, report: Mapping[str, Any]) -> float | None:
-    """P(this check lets the document through), from the service's own report."""
+def accept_probability(name: str, report: Mapping[str, Any]) -> float | None:
+    """P(this check lets the document through), from the service's own report. None for `blank` (a rule on the
+    text length, not a probability)."""
     if name == IDENTITY:
         value = report.get("proba_slip_gaji")
     elif name == BLUR:
@@ -64,9 +65,24 @@ def _accept_probability(name: str, report: Mapping[str, Any]) -> float | None:
     return None if value is None else float(value)
 
 
+def accept_threshold(name: str, report: Mapping[str, Any]) -> float | None:
+    """The threshold that decided `report`, on the accept side like `accept_probability`: the check passes when
+    P(accept) >= it. The request's threshold is already on that side; blur's own is on P(broken) (`p_broken >= t`
+    is blur), so it is turned over. None for `blank` (its limit is `max_chars`, a number of characters)."""
+    if name == IDENTITY:
+        value = report.get("threshold", report.get("reject_threshold"))
+    elif name == BLUR:
+        value = report.get("threshold")
+        if value is not None and report.get("threshold_source") != "request":
+            value = round(1.0 - float(value), 4)
+    else:
+        return None
+    return None if value is None else float(value)
+
+
 def apply_threshold(name: str, report: dict[str, Any], threshold: float | None) -> dict[str, Any]:
     """The report with the request's threshold applied: passes when P(accept) >= threshold."""
-    accept = _accept_probability(name, report)
+    accept = accept_probability(name, report)
     if threshold is None or accept is None:
         return report
     passed = passes(accept, threshold)
@@ -83,7 +99,7 @@ def apply_threshold(name: str, report: dict[str, Any], threshold: float | None) 
 def _rejection_confidence(name: str, report: Mapping[str, Any]) -> float | None:
     if name == BLANK:
         return 1.0
-    accept = _accept_probability(name, report)
+    accept = accept_probability(name, report)
     return None if accept is None else round(1.0 - accept, 4)
 
 
