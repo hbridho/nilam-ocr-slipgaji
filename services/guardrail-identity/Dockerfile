@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir --no-deps --no-build-isolation ./libs/ocr_common 
 
 COPY services/guardrail-identity/app ./app
 
-RUN useradd --create-home --shell /bin/bash appuser
+# Bisa dibaca appuser apa pun umask mesin build (mis. 027 di image hardened): COPY membawa izin berkas dari host.
+RUN chmod -R a+rX /app && useradd --create-home --shell /bin/bash appuser
 USER appuser
 
 ENV PORT=8037
