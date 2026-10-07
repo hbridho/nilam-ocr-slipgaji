@@ -26,6 +26,7 @@ from app.config import Settings, get_settings
 from app.ml.base import Structurer
 from app.ml.mock import MockStructurer
 from app.ml.slip_rules import SlipRulesStructurer
+from app.prompts import RedisClient, RedisPrompt
 from app.services.job_service import StructuringJobService
 from app.services.structuring_service import StructuringService
 
@@ -185,11 +186,42 @@ def get_testing_results() -> StageResults | None:
     return build_stage_results(get_settings(), testing=True)
 
 
+# --- prompt cache ---------------------------------------------------------------------
+
+
+@lru_cache
+def get_redis() -> RedisClient | None:
+    """The Redis in front of the system prompt table (STRUCTURING_PROMPT_REDIS_ENABLED), else None."""
+    settings = get_settings()
+    if not settings.structuring_prompt_redis_enabled:
+        return None
+    from redis.asyncio import Redis
+
+    return Redis.from_url(settings.structuring_redis_url or "", socket_timeout=2, socket_connect_timeout=2)
+
+
+@lru_cache
+def get_redis_prompt() -> RedisPrompt | None:
+    """The active prompt through Redis, checked before every job; None = the prompt read at start-up stays."""
+    redis = get_redis()
+    if redis is None:
+        return None
+    settings = get_settings()
+    return RedisPrompt(
+        redis,
+        database_url=settings.database_url or "",
+        table=settings.prompt_db_table,
+        name=settings.prompt_name,
+        key=settings.structuring_prompt_redis_key,
+        ttl_seconds=settings.structuring_prompt_redis_ttl_seconds,
+    )
+
+
 # --- services (cheap to build: one per request) ------------------------------------------
 
 
 def get_structuring_service() -> StructuringService:
-    return StructuringService(get_structurer())
+    return StructuringService(get_structurer(), get_redis_prompt())
 
 
 def get_job_service() -> StructuringJobService:

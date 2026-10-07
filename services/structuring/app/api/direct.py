@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Depends, Request
-from starlette.concurrency import run_in_threadpool
 
 from ocr_common.errors import BadRequest
 from ocr_common.slip_gaji import DOCUMENT_TYPE
@@ -98,5 +97,5 @@ async def structure_direct(
     if body.document_type != DOCUMENT_TYPE:
         raise BadRequest(f"Unsupported document_type: {body.document_type}. Supported: ['{DOCUMENT_TYPE}']")
     pages = StructuringService.pages_from_ocr(body.ocr.model_dump(exclude_unset=True))
-    data = await run_in_threadpool(service.structure, pages)
+    data = await service.run(pages)
     return envelope(200, "Success", data, body.request_id or get_request_id(request))

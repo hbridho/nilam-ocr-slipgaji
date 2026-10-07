@@ -15,10 +15,10 @@ COPY libs/slip_ml ./libs/slip_ml
 RUN pip install --no-cache-dir --no-deps --no-build-isolation ./libs/ocr_common ./libs/slip_ml
 
 COPY services/scoring/app ./app
-COPY services/scoring/weights ./weights
-RUN test -f weights/trust_model.joblib || (echo "services/scoring/weights/trust_model.joblib tidak ada di build context" && exit 1)
+# Model keyakinan field (conf.json) ikut di libs/slip_ml, atau diunduh dari GCS saat start (SCORING_MODEL_GCS_URI).
 
-RUN useradd --create-home --shell /bin/bash appuser
+# Bisa dibaca appuser apa pun umask mesin build (mis. 027 di image hardened): COPY membawa izin berkas dari host.
+RUN chmod -R a+rX /app && useradd --create-home --shell /bin/bash appuser
 USER appuser
 
 ENV PORT=8033

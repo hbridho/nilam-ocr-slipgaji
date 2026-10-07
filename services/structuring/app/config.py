@@ -1,11 +1,11 @@
 from functools import lru_cache
 from typing import Self
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from ocr_common.config import PipelineSettings
 
-from app.prompts import DEFAULT_PROMPT_PATH
+from app.prompts import DEFAULT_PROMPT_PATH, DEFAULT_REDIS_KEY, DEFAULT_REDIS_TTL_SECONDS
 
 
 class Settings(PipelineSettings):
@@ -58,6 +58,14 @@ class Settings(PipelineSettings):
     # Basis data tidak terbaca saat start -> pakai PROMPT_PATH dengan peringatan (bawaan), supaya
     # gangguan basis data tidak ikut mematikan structuring. `false`: menolak start.
     prompt_db_fallback_to_file: bool = True
+    # Redis di depan tabel itu, seperti nilam-ocr-shm (PROMPT_SOURCE=db, PROMPT_VERSION kosong): baris aktif
+    # dibaca dari key sebelum tiap job; key kosong -> baca tabel lalu isi key (umur TTL, 0 = tidak kedaluwarsa).
+    # Prompt baru berlaku begitu key dihapus (Orkestrasi, atau `redis-cli DEL`) atau kedaluwarsa — tanpa
+    # restart. Prefiks key tim: ocr:prompt:<dokumen>. Redis mati: prompt yang sedang dipakai tetap jalan.
+    structuring_prompt_redis_enabled: bool = False
+    structuring_redis_url: str | None = None
+    structuring_prompt_redis_key: str = Field(DEFAULT_REDIS_KEY, min_length=1)
+    structuring_prompt_redis_ttl_seconds: int = Field(DEFAULT_REDIS_TTL_SECONDS, ge=0)
 
     scoring_service_url: str = "http://127.0.0.1:8033"
     scoring_api_key: str | None = None
@@ -71,6 +79,14 @@ class Settings(PipelineSettings):
             raise ValueError("PROMPT_SOURCE=db needs DATABASE_URL (or PROMPT_DB_FALLBACK_TO_FILE=true)")
         if not self.prompt_db_table.replace("_", "").replace(".", "").isalnum():
             raise ValueError("PROMPT_DB_TABLE must be a plain table name ([schema.]table)")
+        if self.structuring_prompt_redis_enabled:
+            if not self.structuring_redis_url:
+                raise ValueError("STRUCTURING_REDIS_URL is required when STRUCTURING_PROMPT_REDIS_ENABLED=true")
+            if self.prompt_source != "db" or self.prompt_version is not None or not self.database_url:
+                raise ValueError(
+                    "STRUCTURING_PROMPT_REDIS_ENABLED caches the active row of the system_prompt table: it needs "
+                    "PROMPT_SOURCE=db, PROMPT_VERSION empty and the database (CLOUDSQL_INSTANCE or DATABASE_URL)"
+                )
         return self
 
 

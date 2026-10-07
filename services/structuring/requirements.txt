@@ -18,3 +18,6 @@ requests==2.32.3
 # dinyalakan lewat environment, dan saklar yang tidak bisa menyala lebih buruk daripada image
 # yang lebih besar. Buang baris ini kalau lingkungan Anda hanya memakai LLM_BACKEND=http.
 boto3==1.43.106
+# Cache prompt di Redis (STRUCTURING_PROMPT_REDIS_ENABLED), versi yang sama dengan nilam-ocr-shm. Hanya diimpor
+# kalau setelan itu menyala.
+redis==5.2.1

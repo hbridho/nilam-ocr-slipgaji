@@ -19,7 +19,8 @@ COPY services/structuring/app ./app
 # (PROMPT_PATH) atau dibaca dari tabel `prompts` (PROMPT_SOURCE=db) tanpa membangun ulang image.
 COPY services/structuring/prompts ./prompts
 
-RUN useradd --create-home --shell /bin/bash appuser
+# Bisa dibaca appuser apa pun umask mesin build (mis. 027 di image hardened): COPY membawa izin berkas dari host.
+RUN chmod -R a+rX /app && useradd --create-home --shell /bin/bash appuser
 USER appuser
 
 ENV PORT=8032

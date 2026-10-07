@@ -11,6 +11,8 @@ from app.dependencies import (
     get_next_stage,
     get_pipeline,
     get_reaper,
+    get_redis,
+    get_redis_prompt,
     get_relay,
     get_structurer,
     get_testing_next_stage,
@@ -29,6 +31,10 @@ async def lifespan(app: FastAPI):
         from ocr_common.pipeline.database import check_connection
 
         await check_connection(settings.database_url)
+    redis_prompt = get_redis_prompt()
+    if redis_prompt is not None:
+        # Settle on the key's row now (or fill the key), so the first job does not switch prompt.
+        await redis_prompt.refresh()
     pipeline = get_pipeline()
     next_stage = get_next_stage()
     relay = get_relay()
@@ -54,6 +60,9 @@ async def lifespan(app: FastAPI):
             await testing_reaper.stop()
         await get_testing_pipeline().aclose(settings.pipeline_drain_timeout_seconds, relay=testing_relay)
         await get_testing_next_stage().aclose()
+    redis = get_redis()
+    if redis is not None:
+        await redis.aclose()  # ty: ignore[unresolved-attribute]
     if settings.database_url:
         from ocr_common.pipeline.database import dispose_engines
 
@@ -90,6 +99,7 @@ app = create_app(
     backends={
         "structuring": settings.structuring_backend,
         "storage": "postgres" if settings.database_url else "memory",
+        **({"prompt_cache": "redis"} if settings.structuring_prompt_redis_enabled else {}),
     },
     readiness=database_readiness(settings.database_url),
     backends_example={"structuring": "slip_rules", "storage": "postgres"},

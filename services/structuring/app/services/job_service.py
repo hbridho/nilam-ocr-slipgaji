@@ -1,8 +1,6 @@
 from collections.abc import Mapping
 from typing import Any
 
-from starlette.concurrency import run_in_threadpool
-
 from ocr_common.errors import UnprocessableEntity
 from ocr_common.pipeline import STRUCTURING, HandoffPayload, StagePipeline, Work, chain
 from ocr_common.pipeline.results import StageResults, load_upstream
@@ -108,7 +106,7 @@ class StructuringJobService:
         async def work() -> StructuringResult:
             state["ocr"] = ocr if ocr is not None else await load_upstream(self._results, "ocr", request_id)
             pages = StructuringService.pages_from_ocr(state["ocr"])
-            return await run_in_threadpool(self._structuring.structure, pages)
+            return await self._structuring.run(pages)
 
         def handoff(structuring: Mapping[str, Any]) -> dict[str, Any]:
             body: dict[str, Any] = {

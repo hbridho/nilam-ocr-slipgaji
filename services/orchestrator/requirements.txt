@@ -4,8 +4,6 @@ python-multipart==0.0.9
 pydantic-settings==2.5.2
 httpx==0.27.2
 PyMuPDF==1.28.2
-# Driver Postgres async. `ocr_common[db]` hanya memberi sqlalchemy dan greenlet, bukan drivernya,
-# dan orchestrator menulis setiap putusan guardrail ke `guardrails_results`. Tanpa ini pencatatan
-# itu gagal — dan karena sifatnya best-effort, gagalnya TIDAK menggagalkan request: putusannya
-# hilang tanpa ada yang tahu. Versinya sama dengan extraction/structuring/scoring/db.
+# Driver Postgres async, versinya sama dengan extraction/structuring/scoring/db. Orchestrator sendiri tidak
+# menulis basis data: jawaban guardrail dicatat extraction ke `nilam_guardrails_results`.
 asyncpg==0.31.0
