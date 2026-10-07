@@ -19,13 +19,14 @@ from ocr_common.pipeline import (
     build_stale_job_reaper,
 )
 from ocr_common.registry import Factory, build_backend
-from ocr_common.testing_endpoints import testing_path
+from ocr_common.testing_endpoints import TESTING_TABLE_PREFIX, testing_path
 
 from app.config import Settings, get_settings
 from app.ml.api import ApiOcrEngine
 from app.ml.base import OcrEngine
 from app.ml.mock import MockOcrEngine
 from app.services.extraction_service import ExtractionService
+from app.services.guardrails_log import SqlGuardrailsLog
 from app.services.job_service import ExtractionJobService
 
 DB_TABLE_PREFIX = "ocr"
@@ -165,7 +166,21 @@ def get_extraction_service() -> ExtractionService:
     return ExtractionService(get_ocr_engine(), get_settings(), get_guardrails_client())
 
 
-def _job_service(pipeline: StagePipeline) -> ExtractionJobService:
+@lru_cache
+def get_guardrails_log() -> SqlGuardrailsLog | None:
+    """Jawaban tiap guardrail ke `nilam_guardrails_results`; tanpa basis data tidak ada yang dicatat."""
+    database_url = get_settings().database_url
+    return SqlGuardrailsLog(database_url) if database_url else None
+
+
+@lru_cache
+def get_testing_guardrails_log() -> SqlGuardrailsLog | None:
+    """Sama, untuk endpoint `-test`: `nilam_testing_guardrails_results`."""
+    database_url = get_settings().database_url
+    return SqlGuardrailsLog(database_url, table_prefix=TESTING_TABLE_PREFIX) if database_url else None
+
+
+def _job_service(pipeline: StagePipeline, guardrails_log: SqlGuardrailsLog | None) -> ExtractionJobService:
     settings = get_settings()
     return ExtractionJobService(
         pipeline,
@@ -174,15 +189,16 @@ def _job_service(pipeline: StagePipeline) -> ExtractionJobService:
         url_policy=settings.file_url_policy,
         simulate_delay=settings.is_local,
         handoff_by_reference=settings.pipeline_handoff_by_reference,
+        guardrails_log=guardrails_log,
     )
 
 
 def get_job_service() -> ExtractionJobService:
-    return _job_service(get_pipeline())
+    return _job_service(get_pipeline(), get_guardrails_log())
 
 
 def get_testing_job_service() -> ExtractionJobService:
-    return _job_service(get_testing_pipeline())
+    return _job_service(get_testing_pipeline(), get_testing_guardrails_log())
 
 
 @lru_cache

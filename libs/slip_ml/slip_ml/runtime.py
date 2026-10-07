@@ -91,9 +91,9 @@ def configure(*, llm: dict[str, Any] | None = None, prompt: dict[str, Any] | Non
     """Timpa setelan `llm:` dan penunjuk `prompt:`. Nilai None diabaikan (berarti "jangan ubah").
 
     Mengembalikan {"llm": {kunci: nilai}, "prompt": meta, "state": state()} — hanya yang berubah.
-    Melempar ValueError untuk backend atau sumber prompt yang tidak terdaftar, dan untuk berkas
-    prompt yang tidak ada: lebih baik service menolak start daripada berjalan dengan prompt yang
-    bukan yang diminta, karena hasilnya tetap kelihatan masuk akal.
+    Melempar ValueError untuk backend atau sumber prompt yang tidak terdaftar, dan untuk prompt
+    kosong; FileNotFoundError untuk berkas prompt yang tidak ada: lebih baik service menolak start
+    daripada berjalan dengan prompt yang bukan yang diminta, karena hasilnya tetap kelihatan masuk akal.
     """
     changed_llm: dict[str, Any] = {}
 
@@ -141,9 +141,21 @@ def configure(*, llm: dict[str, Any] | None = None, prompt: dict[str, Any] | Non
                 )
             spec["source"] = source
             text, meta = _config.resolve_prompt(spec, _config.CONFIG_FILE.resolve().parent)
-            if not text.strip():
-                raise ValueError(f"prompt dari {source!r} kosong: {spec}")
-            _config.PROMPT, _config.PROMPT_META = text, meta
-            _structure.LLM_PROMPT = text
+            use_prompt(text, meta)
 
     return {"llm": changed_llm, "prompt": meta, "state": state()}
+
+
+def current_prompt() -> tuple[str, dict[str, Any]]:
+    """(teks, meta) prompt yang dipakai saat memanggil LLM sekarang."""
+    return _structure.LLM_PROMPT or "", dict(_config.PROMPT_META)
+
+
+def use_prompt(text: str, meta: dict[str, Any]) -> None:
+    """Pasang teks prompt yang sudah dibaca, tanpa resolver — untuk prompt yang berganti saat service
+    berjalan (cache Redis di service structuring). Ditulis ke tiga tempat yang sama dengan `configure`:
+    `s2_structure.LLM_PROMPT` yang dipakai saat memanggil, dan `PROMPT`/`PROMPT_META` yang dilaporkan."""
+    if not text.strip():
+        raise ValueError(f"prompt dari {meta.get('source')!r} kosong: {meta}")
+    _config.PROMPT, _config.PROMPT_META = text, dict(meta)
+    _structure.LLM_PROMPT = text

@@ -19,6 +19,7 @@ from ocr_common.slip_gaji import DOCUMENT_TYPE, guardrails_data, ocr_data
 from ocr_common.types import OcrResult
 
 from app.services.extraction_service import ExtractionService
+from app.services.guardrails_log import SqlGuardrailsLog
 
 UploadedFile = tuple[bytes, str, str | None]
 Source = UploadedFile | str
@@ -52,6 +53,7 @@ class ExtractionJobService:
         *,
         simulate_delay: bool = False,
         handoff_by_reference: bool = False,
+        guardrails_log: SqlGuardrailsLog | None = None,
     ):
         self._pipeline = pipeline
         self._extraction = extraction
@@ -59,6 +61,7 @@ class ExtractionJobService:
         self._url_policy = url_policy
         self._simulate_delay = simulate_delay
         self._handoff_by_reference = handoff_by_reference
+        self._guardrails_log = guardrails_log
 
     async def submit(
         self,
@@ -144,7 +147,7 @@ class ExtractionJobService:
             delay = simulated_delay_seconds(filename, enabled=self._simulate_delay)
             if delay:
                 await asyncio.sleep(delay)
-            return await self._extraction.extract(  # ty: ignore[invalid-return-type]
+            result = await self._extraction.extract(
                 filename,
                 content_type,
                 content,
@@ -152,6 +155,10 @@ class ExtractionJobService:
                 run_guardrails=runs_guardrails(sequence),
                 guardrail_thresholds=guardrail_thresholds,
             )
+            # Jawaban tiap guardrail ke nilam_guardrails_results, juga dokumen yang ditolak (best-effort).
+            if self._guardrails_log is not None and result.get("guardrails"):
+                await self._guardrails_log.record(request_id, result["guardrails"], sequence=sequence)
+            return result  # ty: ignore[invalid-return-type]
 
         def handoff(ocr: Mapping[str, Any]) -> dict[str, Any]:
             body: dict[str, Any] = {
