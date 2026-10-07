@@ -162,6 +162,12 @@ dokumen NILAM lain seperti SHM), skema **`nilam_ocr_slipgaji`**: tabel job/hasil
 satu baris aktif) untuk prompt LLM bila `PROMPT_SOURCE=db`. Semua dibuat migrasi `db/` (0010 memindahkan tabel
 lama dari `public` beserta isinya).
 
+**Cache prompt di Redis** (bila `STRUCTURING_PROMPT_REDIS_ENABLED=true`, seperti nilam-ocr-shm): structuring membaca
+baris aktif dari key **`ocr:prompt:slipgaji`** (prefiks tim `ocr:prompt:<dokumen>`) sebelum tiap job. Nilainya JSON
+`{"version", "system_prompt", "change_note", "created_at"}`, ditulis service saat key kosong, umur 3600 dtk. Setelah
+admin memindahkan `is_active` ke baris baru, **hapus key itu** (`DEL ocr:prompt:slipgaji`); job berikutnya membaca baris
+baru dan mengisi key lagi, tanpa restart. Tanpa penghapusan, prompt baru berlaku paling lambat saat key kedaluwarsa.
+
 ## 8. Endpoint internal tanpa pipeline
 
 Untuk pengujian tim ML, tidak dipanggil Orkestrasi: `POST /v1/structuring-direct` (structuring, body

@@ -10,7 +10,8 @@
 # `slipgaji` milik compose ini, saling memanggil dengan nama service. Setiap nilai berasal dari .env (interpolasi,
 # urutannya sama dengan vm.env.example); .env tidak pernah masuk utuh ke container, jadi setiap service hanya
 # menerima variabel yang memang miliknya (CLOUDSQL_* hanya ke ketiga tahap pipeline dan migrate, identitas GCS hanya
-# ke yang mengunduh model, Bedrock hanya ke structuring). Variabel kosong = bawaan service.
+# ke yang mengunduh model, Bedrock hanya ke structuring). Variabel kosong = bawaan service. Container kedelapan,
+# `redis` (cache prompt structuring), hanya jalan dengan COMPOSE_PROFILES=redis di .env.
 # Setelan lain per service yang tidak ada di vm.env.example: env/<service>.env, opsional.
 name: nilam-ocr-slipgaji
 
@@ -221,7 +222,46 @@ services:
       PROMPT_SOURCE: ${PROMPT_SOURCE:-file}
       PROMPT_VERSION: ${PROMPT_VERSION:-}
       PROMPT_DB_FALLBACK_TO_FILE: ${PROMPT_DB_FALLBACK_TO_FILE:-true}
-    depends_on: [scoring]
+      # Cache prompt di Redis. URL kosong = container `redis` di bawah, dengan REDIS_PASSWORD.
+      STRUCTURING_PROMPT_REDIS_ENABLED: ${STRUCTURING_PROMPT_REDIS_ENABLED:-false}
+      STRUCTURING_REDIS_URL: ${STRUCTURING_REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
+      STRUCTURING_PROMPT_REDIS_KEY: ${STRUCTURING_PROMPT_REDIS_KEY:-ocr:prompt:slipgaji}
+      STRUCTURING_PROMPT_REDIS_TTL_SECONDS: ${STRUCTURING_PROMPT_REDIS_TTL_SECONDS:-3600}
+    depends_on:
+      scoring:
+        condition: service_started
+      # Hanya kalau profil `redis` aktif (COMPOSE_PROFILES=redis); tanpa itu structuring start seperti biasa.
+      redis:
+        condition: service_healthy
+        required: false
+
+  # 7. Cache prompt structuring (STRUCTURING_PROMPT_REDIS_ENABLED): satu key, ocr:prompt:slipgaji. Hanya cache — isinya
+  # selalu bisa dibangun ulang dari tabel system_prompt — jadi tanpa persistensi, maks. 64 MB. Jalan hanya dengan
+  # COMPOSE_PROFILES=redis di .env; tidak membuka port di VM (hanya jaringan slipgaji). Pakai Redis Orkestrasi:
+  # isi STRUCTURING_REDIS_URL dan kosongkan COMPOSE_PROFILES.
+  redis:
+    <<: *service
+    image: redis:7.4-alpine
+    container_name: ms-bribrain-nilam-ocr-slipgaji-redis
+    profiles: [redis]
+    user: redis
+    tmpfs:
+      - /data
+    stop_grace_period: 10s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command:
+      - sh
+      - -c
+      - >-
+        [ -n "$$REDIS_PASSWORD" ] || { echo "isi REDIS_PASSWORD di .env" >&2; exit 1; };
+        exec redis-server --requirepass "$$REDIS_PASSWORD" --save "" --appendonly no
+        --maxmemory 64mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   # 6 + 8. P(nilai benar) per field, skala 0-1; confidence 0/1 per ambang.
   scoring:

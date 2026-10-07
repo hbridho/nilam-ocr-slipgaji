@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir --no-deps --no-build-isolation ./libs/ocr_common
 
 COPY db ./db
 
-RUN useradd --create-home --shell /bin/bash appuser
+# Bisa dibaca appuser apa pun umask mesin build (mis. 027 di image hardened): COPY membawa izin berkas dari host.
+RUN chmod -R a+rX /app && useradd --create-home --shell /bin/bash appuser
 USER appuser
 
 CMD ["python", "-m", "alembic", "-c", "db/alembic.ini", "upgrade", "head"]

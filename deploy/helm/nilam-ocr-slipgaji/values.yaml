@@ -335,6 +335,14 @@ services:
       # PROMPT_VERSION: "1"
       # PROMPT_PATH: /etc/prompts/slip_gaji.v2.md
       # PROMPT_DB_FALLBACK_TO_FILE: "true"
+      # Redis di depan tabel itu, seperti nilam-ocr-shm (butuh PROMPT_SOURCE=db, PROMPT_VERSION kosong): baris aktif
+      # dibaca dari key sebelum tiap job; prompt baru sampai ke semua pod begitu key dihapus (oleh Orkestrasi pusat)
+      # atau kedaluwarsa, tanpa rollout. Prefiks key tim: ocr:prompt:<dokumen>. Redis ocr-dev tanpa password, jadi
+      # URL-nya boleh di sini (ConfigMap), seperti values-ddb-dev.yaml nilam-ocr-shm.
+      STRUCTURING_PROMPT_REDIS_ENABLED: "false"
+      STRUCTURING_PROMPT_REDIS_KEY: ocr:prompt:slipgaji
+      STRUCTURING_PROMPT_REDIS_TTL_SECONDS: "3600"
+      # STRUCTURING_REDIS_URL: redis://redis-0.redis.ocr-dev.svc.cluster.local:6379/0
     resources:
       requests:
         cpu: 250m

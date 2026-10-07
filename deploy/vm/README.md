@@ -13,6 +13,7 @@ slip gaji dipindah ke GKE.
 | `ms-bribrain-nilam-ocr-slipgaji-guardrail-identity` | 8037 | – | `is_slip_gaji_doc_confidence` |
 | `ms-bribrain-nilam-ocr-slipgaji-structuring` | 8032 | ya (+ `system_prompt`) | – |
 | `ms-bribrain-nilam-ocr-slipgaji-scoring` | 8033 | ya | `field_confidence` |
+| `ms-bribrain-nilam-ocr-slipgaji-redis` (opsional, `COMPOSE_PROFILES=redis`) | 6379, hanya di jaringan compose | – | – |
 
 ## 1. Prasyarat di VM
 
@@ -49,6 +50,10 @@ variabel hanya ke container yang memakainya.
   VM (butuh `roles/storage.objectViewer` di bucket). URI dikosongkan = model yang ikut di image.
 - LLM: `ENABLE_LLM=true` + `LLM_BACKEND` (`bedrock` dengan `BEDROCK_*`, atau `http` dengan `LLM_ENDPOINT` /
   `LLM_GATEWAY_KEY`). Prompt dari tabel: `PROMPT_SOURCE=db`.
+- Cache prompt di Redis (seperti nilam-ocr-shm, key `ocr:prompt:slipgaji`): `PROMPT_SOURCE=db`,
+  `STRUCTURING_PROMPT_REDIS_ENABLED=true`, `COMPOSE_PROFILES=redis` dan `REDIS_PASSWORD` (`openssl rand -hex 24`).
+  Container kedelapan `redis` ikut jalan; `STRUCTURING_REDIS_URL` kosong = container itu. Prompt baru lalu berlaku
+  tanpa restart (lihat Operasi). Pakai Redis Orkestrasi: isi `STRUCTURING_REDIS_URL`, kosongkan `COMPOSE_PROFILES`.
 
 ## 3a. Rilis (image dari registry)
 
@@ -76,9 +81,12 @@ docker compose --profile migrate run --rm migrate && docker compose up -d
 | Log satu service | `docker compose logs -f --tail=200 extraction` |
 | Matikan satu guardrail | `.env`: `GUARDRAIL_BLUR_ENABLED=false`, lalu `docker compose up -d` (opsional `docker compose stop guardrail-blur`) |
 | Model baru dari GCS | unggah versi baru, ganti URI di `.env`, `docker compose up -d` (container yang berubah dibuat ulang) |
-| Prompt baru (`PROMPT_SOURCE=db`) | `INSERT` baris baru di `nilam_ocr_slipgaji.system_prompt`, pindahkan `is_active`, `docker compose restart structuring` |
+| Prompt baru (`PROMPT_SOURCE=db`) | `bash deploy/vm/scripts/set_prompt.sh <berkas.md> "catatan"`: baris baru di `nilam_ocr_slipgaji.system_prompt` jadi `is_active`, lalu key Redis dihapus sehingga job berikutnya memakainya (tanpa Redis: `docker compose restart structuring`). Tanpa argumen = `services/structuring/prompts/slip_gaji.v1.md`; idempoten. Database baru dengan `PROMPT_SOURCE=db`: jalankan sekali setelah migrasi |
+| Cek ujung ke ujung setelah deploy | `bash deploy/vm/scripts/probe.sh`: dua PDF sintetis (halaman kosong harus 400, slip karangan harus 200) lewat orchestrator, lalu 6 baris mereka di `nilam_guardrails_results`. Tanpa data nasabah |
+| Hapus key prompt (Redis) | `docker exec ms-bribrain-nilam-ocr-slipgaji-redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli DEL ocr:prompt:slipgaji'`. Tanpa ini prompt baru berlaku paling lambat setelah `STRUCTURING_PROMPT_REDIS_TTL_SECONDS` (3600 dtk) |
+| Lihat key prompt | `docker exec ms-bribrain-nilam-ocr-slipgaji-redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli GET ocr:prompt:slipgaji' \| head -c 300`; `TTL ocr:prompt:slipgaji` untuk sisa umurnya |
 | Rollback | `TAG=<sha lama>` lalu `docker compose up -d`. Ke image sebelum migrasi 0010 (tabel masih di `public`): turunkan dulu, `docker compose run --rm migrate python -m alembic -c db/alembic.ini downgrade 0009_guardrails_results_sequence` dengan image yang baru |
-| Berhenti | `docker compose down` (data ada di Cloud SQL, tidak ada volume) |
+| Berhenti | `docker compose down` (data ada di Cloud SQL, tidak ada volume; Redis hanya cache, diisi lagi dari tabel) |
 
 Container berjalan read-only dengan `/tmp` tmpfs, `restart: unless-stopped` (ikut menyala setelah VM reboot),
 log json-file dibatasi 5 × 50 MB per container.

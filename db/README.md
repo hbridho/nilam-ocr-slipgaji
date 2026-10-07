@@ -15,7 +15,7 @@ Koneksi: `CLOUDSQL_*` (Cloud SQL Python Connector, aplikasi Entra → WIF → se
 | `ocr_jobs`, `ocr_results` | **repo ini** | extraction | extraction (`GET /v1/extraction/jobs/{request_id}`), orchestrator lewat API itu | status dan hasil tahap OCR |
 | `structuring_jobs`, `structuring_results` | **repo ini** | structuring | structuring lewat API-nya (orchestrator) | status dan field hasil structuring |
 | `scoring_jobs`, `scoring_results` | **repo ini** | scoring | scoring lewat API-nya (orchestrator) | status dan skor trust model |
-| `guardrails_results` | **repo ini** | orchestrator | tidak ada service; untuk audit dan analisis | setiap putusan guardrails, termasuk dokumen yang ditolak, dengan threshold yang memutuskan dan asalnya (`threshold_source`: `request` dari Orkestrasi pusat, `service` milik guardrails), dan laporan lengkapnya. Append-only (migrasi `0008`) |
+| `guardrails_results` | **repo ini** | extraction (job OCR, best-effort) | tidak ada service; untuk audit dan analisis | jawaban **tiap guardrail**: satu baris per `guardrail` (`blank`, `blur`, `identity`) setiap kali dokumen dinilai, termasuk dokumen yang ditolak; guardrail yang dimatikan/tidak menjawab tetap dapat baris (`verdict` `skipped`/`unavailable`). `confidence` dan `threshold` di sisi accept (`passed` = `confidence >= threshold`), asal threshold (`threshold_source`: `request` dari Orkestrasi pusat, `service` milik guardrail), dan jawaban guardrail apa adanya di `report`. Append-only (migrasi `0008`, kolom `guardrail` migrasi `0011`) |
 | `ocr_slip_gaji_requests` | — | tidak ada | tidak ada | tabel kontrak lama sinkron (`generate-request-id` → `extract-ocr` → `get-ocr-result`) yang sudah dihapus dari extraction; **dihapus oleh migrasi `0007_drop_ocr_slip_gaji_requests`**. Jumlah barisnya dicatat di log job migrasi sebelum di-drop; `downgrade` membuat ulang tabel kosong, isinya tidak kembali |
 | `pipeline_outbox` | **repo ini** | ketiga tahap (dalam transaksi job), relay | relay tiap service, `GET /v1/<tahap>/outbox` | callback dan handoff yang belum terkirim (`PIPELINE_OUTBOX`). Baris dihapus setelah terkirim; yang gagal permanen (4xx, atau 5xx lebih lama dari `PIPELINE_OUTBOX_MAX_AGE_SECONDS`) tetap ada sebagai dead letter dengan `failed_at` + `last_error`, tidak pernah diambil lagi oleh relay, dan dilepas manual dengan `failed_at = NULL, next_attempt_at = now()`. `ds` dipakai untuk membersihkan dead letter lama |
 | `testing_ocr_jobs`/`_results`, `testing_structuring_jobs`/`_results`, `testing_scoring_jobs`/`_results`, `testing_pipeline_outbox`, `testing_guardrails_results` | **repo ini** | ketiga tahap (dan orchestrator untuk putusan guardrails) lewat endpoint `-test` (`TESTING_ENDPOINTS`) | tahap itu sendiri, orchestrator lewat `GET /v1/<tahap>/jobs-test/{request_id}` | salinan persis tabel tahap dan outbox untuk load test tim ML (migrasi `0006`). Tidak pernah dibaca Orkestrasi; boleh di-`TRUNCATE` kapan saja setelah tes. Lihat README, "Endpoint Testing" |
@@ -24,7 +24,15 @@ Koneksi: `CLOUDSQL_*` (Cloud SQL Python Connector, aplikasi Entra → WIF → se
 | `orchestration_*` lainnya, `auth_*`, `datahub_lookup_log` (schema `ocr`) | **orkestrasi** | orkestrasi | orkestrasi | di luar repo ini. Migrasi di sini tidak pernah membuat atau mengubahnya |
 | `ocr.*`, `structuring.*`, `scoring.*` (schema terpisah) | — | tidak ada | tidak ada | sisa desain lama sebelum tabel pindah ke schema `public`; **dihapus oleh migrasi `0005_drop_legacy_schemas`**. Migrasi itu hanya membuang schema yang isinya persis `jobs` + `results`; kalau ada tabel atau view lain di dalamnya, migrasi berhenti dengan pesan supaya diperiksa dulu. Jumlah baris yang dibuang dicatat di log Alembic |
 
-Orchestrator membaca status tahap lewat API, bukan lewat database; satu-satunya tabel yang ditulisnya adalah `guardrails_results` (best-effort). Guardrails tidak punya tabel.
+Orchestrator membaca status tahap lewat API dan tidak menulis database. Guardrails tidak punya tabel: ketiganya dipanggil extraction setelah OCR, dan extraction yang mencatat jawabannya di `guardrails_results`.
+
+Contoh analisis, berapa dokumen yang ditahan tiap guardrail per hari:
+
+```sql
+SELECT ds, guardrail, verdict, count(*)
+  FROM nilam_ocr_slipgaji.nilam_guardrails_results
+ GROUP BY 1, 2, 3 ORDER BY 1 DESC, 2, 3;
+```
 
 Ketiga tahap juga bisa menulis status request ke `orchestration_extract_ocr` di transaksi
 yang sama dengan penyimpanan hasilnya, kalau `ORCHESTRATION_OUTCOME_TABLE` diisi (default
